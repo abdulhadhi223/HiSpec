@@ -1,0 +1,251 @@
+"""
+app/services/ew_track_service.py
+Business logic for EW Track feature.
+All DB operations live here — routers stay thin.
+"""
+import uuid
+from typing import Optional
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
+from app.models.ew_track_models import (
+    EWTrack,
+    EWTrackEmitter,
+    EWTrackPoint,
+    EWTrackPointSensor,
+    Emitter,
+    Mission,
+    Platform,
+    Sensor,
+)
+from app.schemas.ew_track import (
+    EWTrackCreate,
+    EWTrackEmitterCreate,
+    EWTrackPointCreate,
+    EWTrackPointSensorCreate,
+    EWTrackUpdate,
+    EmitterCreate,
+    MissionCreate,
+    PlatformCreate,
+    SensorCreate,
+)
+
+
+# ── Sensor ────────────────────────────────────────────────────────────────────
+
+def create_sensor(db: Session, data: SensorCreate) -> Sensor:
+    sensor = Sensor(**data.model_dump())
+    db.add(sensor)
+    db.commit()
+    db.refresh(sensor)
+    return sensor
+
+def get_sensor(db: Session, key: uuid.UUID) -> Optional[Sensor]:
+    return db.get(Sensor, key)
+
+def list_sensors(db: Session, skip: int = 0, limit: int = 100) -> list[Sensor]:
+    return db.execute(select(Sensor).offset(skip).limit(limit)).scalars().all()
+
+
+# ── Platform ──────────────────────────────────────────────────────────────────
+
+def create_platform(db: Session, data: PlatformCreate) -> Platform:
+    platform = Platform(**data.model_dump())
+    db.add(platform)
+    db.commit()
+    db.refresh(platform)
+    return platform
+
+def get_platform(db: Session, id: uuid.UUID) -> Optional[Platform]:
+    return db.get(Platform, id)
+
+def list_platforms(db: Session, skip: int = 0, limit: int = 100) -> list[Platform]:
+    return db.execute(select(Platform).offset(skip).limit(limit)).scalars().all()
+
+
+# ── Mission ───────────────────────────────────────────────────────────────────
+
+def create_mission(db: Session, data: MissionCreate) -> Mission:
+    mission = Mission(**data.model_dump())
+    db.add(mission)
+    db.commit()
+    db.refresh(mission)
+    return mission
+
+def get_mission(db: Session, id: uuid.UUID) -> Optional[Mission]:
+    return db.get(Mission, id)
+
+def list_missions(db: Session, skip: int = 0, limit: int = 100) -> list[Mission]:
+    return db.execute(select(Mission).offset(skip).limit(limit)).scalars().all()
+
+
+# ── Emitter ───────────────────────────────────────────────────────────────────
+
+def create_emitter(db: Session, data: EmitterCreate) -> Emitter:
+    emitter = Emitter(**data.model_dump())
+    db.add(emitter)
+    db.commit()
+    db.refresh(emitter)
+    return emitter
+
+def get_emitter(db: Session, key: uuid.UUID) -> Optional[Emitter]:
+    return db.get(Emitter, key)
+
+def list_emitters(db: Session, skip: int = 0, limit: int = 100) -> list[Emitter]:
+    return db.execute(select(Emitter).offset(skip).limit(limit)).scalars().all()
+
+
+# ── EWTrack ───────────────────────────────────────────────────────────────────
+
+def create_ew_track(db: Session, data: EWTrackCreate) -> EWTrack:
+    track = EWTrack(**data.model_dump())
+    db.add(track)
+    db.commit()
+    db.refresh(track)
+    return track
+
+def upsert_ew_track(db: Session, data: EWTrackCreate) -> EWTrack:
+    """
+    Idempotent upsert on (source_system, source_track_id).
+    Returns existing record if already present, otherwise inserts.
+    """
+    existing = db.execute(
+        select(EWTrack).where(
+            EWTrack.source_system == data.source_system,
+            EWTrack.source_track_id == data.source_track_id,
+        )
+    ).scalar_one_or_none()
+
+    if existing:
+        # Update mutable fields only
+        for field in ("hostility", "classification", "platform_id", "mission_id"):
+            val = getattr(data, field, None)
+            if val is not None:
+                setattr(existing, field, val)
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    return create_ew_track(db, data)
+
+def get_ew_track(db: Session, id: uuid.UUID) -> Optional[EWTrack]:
+    return db.get(EWTrack, id)
+
+def get_ew_track_detail(db: Session, id: uuid.UUID) -> Optional[EWTrack]:
+    """Eagerly load points and emitters for detail view."""
+    return db.execute(
+        select(EWTrack)
+        .where(EWTrack.id == id)
+        .options(
+            selectinload(EWTrack.track_points),
+            selectinload(EWTrack.track_emitters),
+        )
+    ).scalar_one_or_none()
+
+def list_ew_tracks(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    source_system: Optional[str] = None,
+    mission_id: Optional[uuid.UUID] = None,
+    platform_id: Optional[uuid.UUID] = None,
+) -> list[EWTrack]:
+    stmt = select(EWTrack)
+    if source_system:
+        stmt = stmt.where(EWTrack.source_system == source_system)
+    if mission_id:
+        stmt = stmt.where(EWTrack.mission_id == mission_id)
+    if platform_id:
+        stmt = stmt.where(EWTrack.platform_id == platform_id)
+    return db.execute(stmt.offset(skip).limit(limit)).scalars().all()
+
+def update_ew_track(db: Session, id: uuid.UUID, data: EWTrackUpdate) -> Optional[EWTrack]:
+    track = db.get(EWTrack, id)
+    if not track:
+        return None
+    for field, val in data.model_dump(exclude_unset=True).items():
+        setattr(track, field, val)
+    db.commit()
+    db.refresh(track)
+    return track
+
+def delete_ew_track(db: Session, id: uuid.UUID) -> bool:
+    track = db.get(EWTrack, id)
+    if not track:
+        return False
+    db.delete(track)
+    db.commit()
+    return True
+
+
+# ── EWTrackPoint ──────────────────────────────────────────────────────────────
+
+def append_track_point(db: Session, data: EWTrackPointCreate) -> EWTrackPoint:
+    """
+    Append-only insert. Duplicate (track_id, observed_at, lat, lon) raises
+    IntegrityError — let the router handle it as a 409.
+    """
+    point = EWTrackPoint(**data.model_dump())
+    db.add(point)
+    db.commit()
+    db.refresh(point)
+    return point
+
+def list_track_points(
+    db: Session,
+    track_id: uuid.UUID,
+    skip: int = 0,
+    limit: int = 500,
+) -> list[EWTrackPoint]:
+    return db.execute(
+        select(EWTrackPoint)
+        .where(EWTrackPoint.track_id == track_id)
+        .order_by(EWTrackPoint.observed_at)
+        .offset(skip)
+        .limit(limit)
+    ).scalars().all()
+
+
+# ── EWTrackPointSensor ────────────────────────────────────────────────────────
+
+def add_point_sensor(db: Session, data: EWTrackPointSensorCreate) -> EWTrackPointSensor:
+    ps = EWTrackPointSensor(**data.model_dump())
+    db.add(ps)
+    db.commit()
+    db.refresh(ps)
+    return ps
+
+
+# ── EWTrackEmitter ────────────────────────────────────────────────────────────
+
+def upsert_track_emitter(db: Session, data: EWTrackEmitterCreate) -> EWTrackEmitter:
+    """
+    Upsert on (track_id, emitter_key, emitter_mode).
+    Updates all signal parameters if record exists.
+    """
+    existing = db.execute(
+        select(EWTrackEmitter).where(
+            EWTrackEmitter.track_id    == data.track_id,
+            EWTrackEmitter.emitter_key == data.emitter_key,
+            EWTrackEmitter.emitter_mode == data.emitter_mode,
+        )
+    ).scalar_one_or_none()
+
+    if existing:
+        for field, val in data.model_dump(exclude={"track_id", "emitter_key", "emitter_mode"}).items():
+            setattr(existing, field, val)
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    emitter = EWTrackEmitter(**data.model_dump())
+    db.add(emitter)
+    db.commit()
+    db.refresh(emitter)
+    return emitter
+
+def list_track_emitters(db: Session, track_id: uuid.UUID) -> list[EWTrackEmitter]:
+    return db.execute(
+        select(EWTrackEmitter).where(EWTrackEmitter.track_id == track_id)
+    ).scalars().all()
