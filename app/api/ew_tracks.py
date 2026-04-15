@@ -5,6 +5,9 @@ FastAPI router for EW Track endpoints.
 ACTION REQUIRED in app/main.py — register this router:
     from app.api.ew_tracks import router as ew_tracks_router
     app.include_router(ew_tracks_router)
+
+Reference data (sensors / platforms / missions / emitters) lives in:
+    app/api/reference.py
 """
 import uuid
 from typing import Optional
@@ -13,108 +16,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db   # adjust if your dep function differs
+from app.core.database import get_db
 from app.schemas.ew_track import (
-    EmitterCreate, EmitterResponse,
     EWTrackCreate, EWTrackDetailResponse, EWTrackResponse, EWTrackUpdate,
     EWTrackEmitterCreate, EWTrackEmitterResponse,
     EWTrackPointCreate, EWTrackPointResponse,
     EWTrackPointSensorCreate, EWTrackPointSensorResponse,
-    MissionCreate, MissionResponse,
-    PlatformCreate, PlatformResponse,
-    SensorCreate, SensorResponse,
 )
 from app.services import ew_track_service as svc
 
 router = APIRouter(prefix="/ew", tags=["EW Tracks"])
-
-
-# ── Sensors ───────────────────────────────────────────────────────────────────
-
-@router.post("/sensors", response_model=SensorResponse, status_code=status.HTTP_201_CREATED)
-def create_sensor(data: SensorCreate, db: Session = Depends(get_db)):
-    return svc.create_sensor(db, data)
-
-@router.get("/sensors", response_model=list[SensorResponse])
-def list_sensors(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, le=500),
-    db: Session = Depends(get_db),
-):
-    return svc.list_sensors(db, skip, limit)
-
-@router.get("/sensors/{key}", response_model=SensorResponse)
-def get_sensor(key: uuid.UUID, db: Session = Depends(get_db)):
-    sensor = svc.get_sensor(db, key)
-    if not sensor:
-        raise HTTPException(status_code=404, detail="Sensor not found")
-    return sensor
-
-
-# ── Platforms ─────────────────────────────────────────────────────────────────
-
-@router.post("/platforms", response_model=PlatformResponse, status_code=status.HTTP_201_CREATED)
-def create_platform(data: PlatformCreate, db: Session = Depends(get_db)):
-    return svc.create_platform(db, data)
-
-@router.get("/platforms", response_model=list[PlatformResponse])
-def list_platforms(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, le=500),
-    db: Session = Depends(get_db),
-):
-    return svc.list_platforms(db, skip, limit)
-
-@router.get("/platforms/{id}", response_model=PlatformResponse)
-def get_platform(id: uuid.UUID, db: Session = Depends(get_db)):
-    platform = svc.get_platform(db, id)
-    if not platform:
-        raise HTTPException(status_code=404, detail="Platform not found")
-    return platform
-
-
-# ── Missions ──────────────────────────────────────────────────────────────────
-
-@router.post("/missions", response_model=MissionResponse, status_code=status.HTTP_201_CREATED)
-def create_mission(data: MissionCreate, db: Session = Depends(get_db)):
-    return svc.create_mission(db, data)
-
-@router.get("/missions", response_model=list[MissionResponse])
-def list_missions(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, le=500),
-    db: Session = Depends(get_db),
-):
-    return svc.list_missions(db, skip, limit)
-
-@router.get("/missions/{id}", response_model=MissionResponse)
-def get_mission(id: uuid.UUID, db: Session = Depends(get_db)):
-    mission = svc.get_mission(db, id)
-    if not mission:
-        raise HTTPException(status_code=404, detail="Mission not found")
-    return mission
-
-
-# ── Emitters ──────────────────────────────────────────────────────────────────
-
-@router.post("/emitters", response_model=EmitterResponse, status_code=status.HTTP_201_CREATED)
-def create_emitter(data: EmitterCreate, db: Session = Depends(get_db)):
-    return svc.create_emitter(db, data)
-
-@router.get("/emitters", response_model=list[EmitterResponse])
-def list_emitters(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, le=500),
-    db: Session = Depends(get_db),
-):
-    return svc.list_emitters(db, skip, limit)
-
-@router.get("/emitters/{key}", response_model=EmitterResponse)
-def get_emitter(key: uuid.UUID, db: Session = Depends(get_db)):
-    emitter = svc.get_emitter(db, key)
-    if not emitter:
-        raise HTTPException(status_code=404, detail="Emitter not found")
-    return emitter
 
 
 # ── EW Tracks ─────────────────────────────────────────────────────────────────
@@ -134,11 +45,11 @@ def upsert_track(data: EWTrackCreate, db: Session = Depends(get_db)):
 
 @router.get("/tracks", response_model=list[EWTrackResponse])
 def list_tracks(
-    skip:          int            = Query(0, ge=0),
-    limit:         int            = Query(100, le=500),
-    source_system: Optional[str]  = Query(None),
+    skip:          int                 = Query(0, ge=0),
+    limit:         int                 = Query(100, le=500),
+    source_system: Optional[str]       = Query(None),
     mission_id:    Optional[uuid.UUID] = Query(None),
-    platform_id:   Optional[uuid.UUID] = Query(None),
+    platform_id:   Optional[int]       = Query(None),
     db: Session = Depends(get_db),
 ):
     return svc.list_ew_tracks(db, skip, limit, source_system, mission_id, platform_id)
@@ -167,7 +78,7 @@ def delete_track(id: uuid.UUID, db: Session = Depends(get_db)):
 
 @router.post("/tracks/{track_id}/points", response_model=EWTrackPointResponse, status_code=status.HTTP_201_CREATED)
 def append_point(track_id: uuid.UUID, data: EWTrackPointCreate, db: Session = Depends(get_db)):
-    data.track_id = track_id  # enforce from path
+    data.track_id = track_id
     try:
         return svc.append_track_point(db, data)
     except IntegrityError:
@@ -188,7 +99,7 @@ def list_points(
 
 @router.post("/tracks/{track_id}/emitters", response_model=EWTrackEmitterResponse, status_code=status.HTTP_201_CREATED)
 def upsert_emitter(track_id: uuid.UUID, data: EWTrackEmitterCreate, db: Session = Depends(get_db)):
-    data.track_id = track_id  # enforce from path
+    data.track_id = track_id
     return svc.upsert_track_emitter(db, data)
 
 @router.get("/tracks/{track_id}/emitters", response_model=list[EWTrackEmitterResponse])

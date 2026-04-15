@@ -50,8 +50,8 @@ class ActivityReportResponse(ActivityReportBase):
 
 class ActivityReportDetailResponse(ActivityReportResponse):
     """Full report with nested instances and linked missions."""
-    instances:    list["ActivityReportInstanceResponse"] = []
-    mission_ids:  list[uuid.UUID] = []
+    instances:       list["ActivityReportInstanceResponse"] = []
+    report_missions: list["ActivityReportMissionResponse"]  = []
 
 
 # ---------------------------------------------------------------------------
