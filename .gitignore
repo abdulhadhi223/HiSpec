@@ -1,0 +1,47 @@
+# Claude Code
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+site-packages/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.*
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Alembic (keep alembic.ini but ignore generated migrations if needed)
+# alembic/versions/
+
+# Logs
+*.log
