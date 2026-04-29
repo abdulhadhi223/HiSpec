@@ -1,24 +1,18 @@
-"""
-app/core/database.py
-SQLAlchemy engine, session factory, declarative Base, and get_db dependency.
-"""
-import os
-from typing import Generator
-
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from app.core.config import get_settings
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@localhost/nmdb",
-)
+settings = get_settings()
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
 
 
-def get_db() -> Generator[Session, None, None]:
+class Base(DeclarativeBase):
+    pass
+
+
+def get_db():
     db = SessionLocal()
     try:
         yield db

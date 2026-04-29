@@ -3,61 +3,62 @@ tests/conftest.py
 Shared pytest fixtures for NMDB EW Feature API tests.
 
 Strategy:
-- SQLite in-memory DB (no live PostgreSQL required)
-- gen_random_uuid() registered as a SQLite custom function
-- Tables created once per session; all rows deleted between tests (autouse)
+- Real PostgreSQL database (connection from app.core.config / app.core.database)
+- PostgreSQL enum types created idempotently before table creation
+- Tables created once per session with checkfirst=True; NOT dropped after session
+- All rows deleted between tests for isolation (reverse FK order)
 - Seed fixtures create data through the API so the full stack is exercised
 """
-import uuid as uuid_module
-
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, text
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from app.main import app as fastapi_app
-from app.core.database import Base, get_db
+from app.core.database import Base, SessionLocal, engine, get_db
+from app.core.enum import (
+    ClassificationType,
+    HostilityType,
+    PlatformCategoryType,
+    SensorRoleType,
+    SignalType,
+)
 
-# Import all models so SQLAlchemy registers every table with Base.metadata
+# Register all models so Base.metadata includes every table
 import app.models.orm_models       # noqa: F401
 import app.models.common_models    # noqa: F401
 import app.models.ew_track_models  # noqa: F401
 
-SQLITE_URL = "sqlite:///:memory:"
-
-engine = create_engine(
-    SQLITE_URL,
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
-    echo=False,
-)
-
-
-@event.listens_for(engine, "connect")
-def _setup_sqlite(dbapi_conn, _):
-    """Register gen_random_uuid() and enable FK enforcement in SQLite."""
-    dbapi_conn.create_function(
-        "gen_random_uuid", 0, lambda: str(uuid_module.uuid4())
-    )
-    cursor = dbapi_conn.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
-
-
-TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+_ENUM_TYPES = [
+    ("classification_type", ClassificationType),
+    ("signal_type", SignalType),
+    ("hostility_type", HostilityType),
+    ("platform_category_type", PlatformCategoryType),
+    ("sensor_role_type", SensorRoleType),
+]
 
 
 @pytest.fixture(scope="session", autouse=True)
-def create_tables():
-    Base.metadata.create_all(bind=engine)
+def setup_database():
+    """Create PostgreSQL enum types (idempotent) then create all tables."""
+    with engine.begin() as conn:
+        for type_name, enum_cls in _ENUM_TYPES:
+            values_sql = ", ".join(f"'{v.value}'" for v in enum_cls)
+            conn.execute(text(
+                f"DO $$ BEGIN "
+                f"  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{type_name}') "
+                f"  THEN CREATE TYPE {type_name} AS ENUM ({values_sql}); "
+                f"  END IF; "
+                f"END $$;"
+            ))
+    Base.metadata.create_all(bind=engine, checkfirst=True)
     yield
-    Base.metadata.drop_all(bind=engine)
+    # Tables intentionally NOT dropped — keep schema in place for inspection
 
 
 @pytest.fixture(autouse=True)
 def clean_db():
-    """Truncate every table before each test for full isolation."""
+    """Delete all rows between tests in reverse FK order."""
     yield
     with engine.begin() as conn:
         for table in reversed(Base.metadata.sorted_tables):
@@ -66,10 +67,11 @@ def clean_db():
 
 @pytest.fixture()
 def db():
-    session = TestingSessionLocal()
+    session: Session = SessionLocal()
     try:
         yield session
     finally:
+        session.rollback()
         session.close()
 
 
