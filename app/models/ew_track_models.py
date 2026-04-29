@@ -3,19 +3,11 @@ app/models/ew_track_models.py
 
 EW Track & Activity Report ORM models — schema v5.0.
 
-Mission and Emitter have been moved to app/models/common_models.py.
-This file imports them from there — do NOT redefine them here.
+Mission lives in app/models/common_models.py.
+This file imports it from there — do NOT redefine it here.
 
 External entity references (no ORM class defined here):
-  - TechPlatformInstance → tech_platform_instance.id (Integer, orm_models.py)
-  - TechSensor           → tech_sensor.id            (Integer, orm_models.py)
-
-ACTION REQUIRED in app/models/__init__.py — ensure all three model files
-are imported so SQLAlchemy registers every table with Base.metadata:
-
-    from app.models import orm_models       # existing
-    from app.models import common_models    # new
-    from app.models import ew_track_models  # new
+  - SensorCatalog → sensor_catalog.id (UUID, orm_models.py)
 """
 
 import uuid
@@ -26,7 +18,7 @@ from sqlalchemy import (
     Double,
     Enum as SAEnum,
     ForeignKey,
-    Integer,
+    Integer,  # used by ActivityReportInstance
     String,
     TIMESTAMP,
     UniqueConstraint,
@@ -37,7 +29,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.core.enum import (
-    ClassificationType,
+    Classification,
     HostilityType,
     PlatformCategoryType,
     SensorRoleType,
@@ -45,16 +37,13 @@ from app.core.enum import (
 )
 
 # ── Import shared entities from common_models ─────────────────────────────────
-# Re-export them so callers can do:
-#   from app.models.ew_track_models import Mission, Emitter
-# if they prefer a single import point.
-from app.models.common_models import Emitter, Mission  # noqa: F401
+from app.models.common_models import Mission  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # SA Enum column types  (create_type=False — migration owns PG type lifecycle)
 # ---------------------------------------------------------------------------
 TZ    = TIMESTAMP(timezone=True)
-_cls  = SAEnum(ClassificationType,   name="classification_type",    create_type=False)
+_cls  = SAEnum(Classification,   name="classification_type",    create_type=False)
 _sig  = SAEnum(SignalType,           name="signal_type",            create_type=False)
 _hos  = SAEnum(HostilityType,        name="hostility_type",         create_type=False)
 _pcat = SAEnum(PlatformCategoryType, name="platform_category_type", create_type=False)
@@ -69,8 +58,7 @@ class EWTrack(Base):
     Master track record per emitter observation.
     UNIQUE (source_system, source_track_id) → idempotent ingestion.
 
-    platform_id → tech_platform_instance.id  (Integer FK, existing table)
-    mission_id  → mission.id                 (UUID FK, common_models.py)
+    mission_id → mission.id (UUID FK, common_models.py)
     """
     __tablename__ = "ew_track"
     __table_args__ = (
@@ -86,14 +74,8 @@ class EWTrack(Base):
     source_system:   Mapped[str]                = mapped_column(String(64),  nullable=False)
     source_track_id: Mapped[str | None]         = mapped_column(String(128), nullable=True)
     hostility:       Mapped[HostilityType]      = mapped_column(_hos, nullable=False)
-    classification:  Mapped[ClassificationType] = mapped_column(_cls, nullable=False)
+    classification:  Mapped[Classification] = mapped_column(_cls, nullable=False)
 
-    # Integer FK → existing tech_platform_instance table (orm_models.py)
-    platform_id: Mapped[int | None] = mapped_column(
-        Integer,
-        ForeignKey("tech_platform_instance.id", ondelete="SET NULL"),
-        nullable=True,
-    )
     # UUID FK → mission (common_models.py)
     mission_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -101,13 +83,18 @@ class EWTrack(Base):
         nullable=True,
     )
 
+    # Platform snapshot (stored as strings — no FK)
+    platform_id:           Mapped[str | None]                  = mapped_column(String(64),  nullable=True)
+    platform_name:         Mapped[str | None]                  = mapped_column(String(255), nullable=True)
+    platform_class:        Mapped[str | None]                  = mapped_column(String(128), nullable=True)
+    platform_country_code: Mapped[str | None]                  = mapped_column(String(3),   nullable=True)
+    platform_country_name: Mapped[str | None]                  = mapped_column(String(128), nullable=True)
+    platform_category:     Mapped[PlatformCategoryType | None] = mapped_column(_pcat,       nullable=True)
+
     created_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
     updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
 
     # Relationships
-    platform: Mapped["TechPlatformInstance | None"] = relationship(
-        "TechPlatformInstance", foreign_keys=[platform_id]
-    )
     mission: Mapped["Mission | None"] = relationship(
         "Mission", back_populates="ew_tracks"
     )
@@ -153,7 +140,7 @@ class EWTrackPoint(Base):
     lat:            Mapped[float]              = mapped_column(Double, nullable=False)
     lon:            Mapped[float]              = mapped_column(Double, nullable=False)
     error_m:        Mapped[float | None]       = mapped_column(Double, nullable=True)
-    classification: Mapped[ClassificationType] = mapped_column(_cls,   nullable=False)
+    classification: Mapped[Classification] = mapped_column(_cls,   nullable=False)
 
     track:         Mapped["EWTrack"]                  = relationship(back_populates="track_points")
     point_sensors: Mapped[list["EWTrackPointSensor"]] = relationship(
@@ -167,12 +154,12 @@ class EWTrackPoint(Base):
 class EWTrackPointSensor(Base):
     """
     Junction: which sensor produced which track point.
-    sensor_id → tech_sensor.id  (Integer FK, existing table in orm_models.py)
-    UNIQUE (point_id, sensor_id)
+    sensor_catalog_id → sensor_catalog.id  (UUID FK, orm_models.py)
+    UNIQUE (point_id, sensor_catalog_id)
     """
     __tablename__ = "ew_track_point_sensor"
     __table_args__ = (
-        UniqueConstraint("point_id", "sensor_id", name="ew_track_point_sensor_unique"),
+        UniqueConstraint("point_id", "sensor_catalog_id", name="ew_track_point_sensor_unique"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -182,14 +169,12 @@ class EWTrackPointSensor(Base):
     point_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("ew_track_point.id"), nullable=False
     )
-    # Integer FK → existing tech_sensor table (orm_models.py)
-    sensor_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("tech_sensor.id", ondelete="RESTRICT"), nullable=False
+    sensor_catalog_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sensor_catalog.id", ondelete="RESTRICT"), nullable=False
     )
     role: Mapped[SensorRoleType | None] = mapped_column(_role, nullable=True)
 
-    point:  Mapped["EWTrackPoint"] = relationship(back_populates="point_sensors")
-    sensor: Mapped["TechSensor"]   = relationship("TechSensor", foreign_keys=[sensor_id])
+    point: Mapped["EWTrackPoint"] = relationship(back_populates="point_sensors")
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +182,9 @@ class EWTrackPointSensor(Base):
 # ---------------------------------------------------------------------------
 class EWTrackEmitter(Base):
     """
-    Emitter identity + full RF fingerprint per track per emitter mode.
-    One row per unique (track_id, emitter_key, emitter_mode).
-
-    emitter_key → emitter.key  (UUID FK, common_models.py)
+    Emitter identity + RF fingerprint per track per emitter mode.
+    Emitter fields are stored as plain strings (no FK to emitter catalog).
+    UNIQUE (track_id, emitter_mode)
     """
     __tablename__ = "ew_track_emitter"
     __table_args__ = (
@@ -208,24 +192,28 @@ class EWTrackEmitter(Base):
             "emitter_confidence IS NULL OR emitter_confidence BETWEEN 0 AND 1",
             name="ew_track_emitter_confidence_range",
         ),
-        UniqueConstraint(
-            "track_id", "emitter_key", "emitter_mode",
-            name="ew_track_emitter_unique",
-        ),
+        UniqueConstraint("track_id", "emitter_mode", name="ew_track_emitter_unique"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
-    track_id:    Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("ew_track.id"),  nullable=False)
-    emitter_key: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("emitter.key"), nullable=False)
+    track_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("ew_track.id"), nullable=False
+    )
 
-    first_seen_at:      Mapped[datetime.datetime] = mapped_column(TZ,           nullable=False)
-    last_seen_at:       Mapped[datetime.datetime] = mapped_column(TZ,           nullable=False)
-    emitter_confidence: Mapped[float | None]      = mapped_column(Double,       nullable=True)
-    signal_type:        Mapped[SignalType]         = mapped_column(_sig,         nullable=False)
-    emitter_mode:       Mapped[str]               = mapped_column(String(128),  nullable=False)
+    # Emitter identity (stored as strings — no FK)
+    emitter_id_sensor:    Mapped[str | None] = mapped_column(String(64),  nullable=True)
+    emitter_name:         Mapped[str | None] = mapped_column(String(255), nullable=True)
+    emitter_country_code: Mapped[str | None] = mapped_column(String(3),   nullable=True)
+    emitter_country_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    first_seen_at:      Mapped[datetime.datetime] = mapped_column(TZ,          nullable=False)
+    last_seen_at:       Mapped[datetime.datetime] = mapped_column(TZ,          nullable=False)
+    emitter_confidence: Mapped[float | None]      = mapped_column(Double,      nullable=True)
+    signal_type:        Mapped[SignalType]         = mapped_column(_sig,        nullable=False)
+    emitter_mode:       Mapped[str]               = mapped_column(String(128), nullable=False)
 
     # Frequency (MHz)
     freq_low_mhz:    Mapped[float | None] = mapped_column(Double, nullable=True)
@@ -245,8 +233,7 @@ class EWTrackEmitter(Base):
     created_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
     updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
 
-    track:   Mapped["EWTrack"]  = relationship(back_populates="track_emitters")
-    emitter: Mapped["Emitter"]  = relationship("Emitter", back_populates="ew_track_emitters")
+    track: Mapped["EWTrack"] = relationship(back_populates="track_emitters")
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +257,7 @@ class ActivityReport(Base):
     submitted_by:   Mapped[str]                      = mapped_column(String(255), nullable=False)
     start_at:       Mapped[datetime.datetime | None] = mapped_column(TZ, nullable=True)
     end_at:         Mapped[datetime.datetime | None] = mapped_column(TZ, nullable=True)
-    classification: Mapped[ClassificationType]       = mapped_column(_cls, nullable=False)
+    classification: Mapped[Classification]       = mapped_column(_cls, nullable=False)
     created_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
     updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
 
@@ -335,7 +322,7 @@ class ActivityReportInstance(Base):
     platform_class:    Mapped[str | None]                  = mapped_column(String(128), nullable=True)
 
     # Metadata
-    classification: Mapped[ClassificationType] = mapped_column(_cls,       nullable=False)
+    classification: Mapped[Classification] = mapped_column(_cls,       nullable=False)
     source_system:  Mapped[str]                = mapped_column(String(64), nullable=False)
     created_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
     updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))

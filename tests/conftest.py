@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.main import app as fastapi_app
 from app.core.database import Base, SessionLocal, engine, get_db
 from app.core.enum import (
-    ClassificationType,
+    Classification,
     HostilityType,
     PlatformCategoryType,
     SensorRoleType,
@@ -30,7 +30,7 @@ import app.models.common_models    # noqa: F401
 import app.models.ew_track_models  # noqa: F401
 
 _ENUM_TYPES = [
-    ("classification_type", ClassificationType),
+    ("classification_type", Classification),
     ("signal_type", SignalType),
     ("hostility_type", HostilityType),
     ("platform_category_type", PlatformCategoryType),
@@ -99,25 +99,14 @@ CLASSIFICATION = "SECRET"
 
 
 @pytest.fixture()
-def sensor(client):
-    resp = client.post("/sensors", json={
-        "name": "ELINT Sensor 1",
-        "type": "ELINT",
-        "classification": CLASSIFICATION,
-    })
-    assert resp.status_code == 201, resp.text
-    return resp.json()
-
-
-@pytest.fixture()
-def platform(client):
-    resp = client.post("/platforms", json={
-        "name": "EW Platform Alpha",
-        "category": "aircraft",
-        "classification": CLASSIFICATION,
-    })
-    assert resp.status_code == 201, resp.text
-    return resp.json()
+def sensor_catalog(db):
+    """SensorCatalog — used by EWTrackPointSensor tests."""
+    from app.models.orm_models import SensorCatalog
+    entry = SensorCatalog()
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return {"id": str(entry.id)}
 
 
 @pytest.fixture()
@@ -131,22 +120,11 @@ def mission(client):
 
 
 @pytest.fixture()
-def emitter(client):
-    resp = client.post("/emitters", json={
-        "emitter_name": "AN/ALQ-99",
-        "emitter_country_code": "USA",
-        "emitter_country_name": "United States",
-    })
-    assert resp.status_code == 201, resp.text
-    return resp.json()
-
-
-@pytest.fixture()
 def ew_track(client, mission):
     resp = client.post("/ew/tracks", json={
         "source_system": "Thor",
         "source_track_id": "TRK-SEED-001",
-        "hostility": "hostile",
+        "hostility": "HOSTILE",
         "classification": CLASSIFICATION,
         "mission_id": mission["id"],
     })

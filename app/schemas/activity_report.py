@@ -8,7 +8,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 from app.core.enum import (
-    ClassificationType,
+    Classification,
     HostilityType,
     PlatformCategoryType,
     SignalType,
@@ -23,7 +23,7 @@ class ActivityReportBase(BaseModel):
     submitted_by:   str
     start_at:       Optional[datetime.datetime] = None
     end_at:         Optional[datetime.datetime] = None
-    classification: ClassificationType
+    classification: Classification
 
     @field_validator("end_at")
     @classmethod
@@ -40,7 +40,7 @@ class ActivityReportUpdate(BaseModel):
     name:           Optional[str]               = None
     start_at:       Optional[datetime.datetime] = None
     end_at:         Optional[datetime.datetime] = None
-    classification: Optional[ClassificationType] = None
+    classification: Optional[Classification] = None
 
 class ActivityReportResponse(ActivityReportBase):
     id:         uuid.UUID
@@ -85,7 +85,7 @@ class ActivityReportInstanceBase(BaseModel):
     platform_class:    Optional[str] = None
 
     # Metadata
-    classification: ClassificationType
+    classification: Classification
     source_system:  str
 
     @field_validator("last_seen_dtg")

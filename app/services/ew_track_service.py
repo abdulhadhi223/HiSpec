@@ -3,7 +3,7 @@ app/services/ew_track_service.py
 Business logic for EW Track feature.
 All DB operations live here — routers stay thin.
 
-Reference data CRUD (Sensor, Platform, Mission, Emitter) lives in:
+Reference data CRUD (Sensor, Platform, Mission) lives in:
     app/services/reference_service.py
 """
 import uuid
@@ -23,6 +23,7 @@ from app.schemas.ew_track import (
     EWTrackEmitterCreate,
     EWTrackPointCreate,
     EWTrackPointSensorCreate,
+    EWTrackPointSensorResponse,
     EWTrackUpdate,
 )
 
@@ -49,7 +50,11 @@ def upsert_ew_track(db: Session, data: EWTrackCreate) -> EWTrack:
     ).scalar_one_or_none()
 
     if existing:
-        for field in ("hostility", "classification", "platform_id", "mission_id"):
+        for field in (
+            "hostility", "classification", "mission_id",
+            "platform_id", "platform_name", "platform_class",
+            "platform_country_code", "platform_country_name", "platform_category",
+        ):
             val = getattr(data, field, None)
             if val is not None:
                 setattr(existing, field, val)
@@ -79,15 +84,12 @@ def list_ew_tracks(
     limit: int = 100,
     source_system: Optional[str] = None,
     mission_id: Optional[uuid.UUID] = None,
-    platform_id: Optional[int] = None,
 ) -> list[EWTrack]:
     stmt = select(EWTrack)
     if source_system:
         stmt = stmt.where(EWTrack.source_system == source_system)
     if mission_id:
         stmt = stmt.where(EWTrack.mission_id == mission_id)
-    if platform_id:
-        stmt = stmt.where(EWTrack.platform_id == platform_id)
     return db.execute(stmt.offset(skip).limit(limit)).scalars().all()
 
 def update_ew_track(db: Session, id: uuid.UUID, data: EWTrackUpdate) -> Optional[EWTrack]:
@@ -140,7 +142,11 @@ def list_track_points(
 # ── EWTrackPointSensor ────────────────────────────────────────────────────────
 
 def add_point_sensor(db: Session, data: EWTrackPointSensorCreate) -> EWTrackPointSensor:
-    ps = EWTrackPointSensor(**data.model_dump())
+    ps = EWTrackPointSensor(
+        point_id=data.point_id,
+        sensor_catalog_id=data.sensor_catalog_id,
+        role=data.role,
+    )
     db.add(ps)
     db.commit()
     db.refresh(ps)
@@ -150,32 +156,29 @@ def add_point_sensor(db: Session, data: EWTrackPointSensorCreate) -> EWTrackPoin
 # ── EWTrackEmitter ────────────────────────────────────────────────────────────
 
 def upsert_track_emitter(db: Session, data: EWTrackEmitterCreate) -> EWTrackEmitter:
-    """
-    Upsert on (track_id, emitter_key, emitter_mode).
-    Updates all signal parameters if record exists.
-    """
+    """Upsert on (track_id, emitter_mode). Updates all fields if record exists."""
     existing = db.execute(
         select(EWTrackEmitter).where(
             EWTrackEmitter.track_id     == data.track_id,
-            EWTrackEmitter.emitter_key  == data.emitter_key,
             EWTrackEmitter.emitter_mode == data.emitter_mode,
         )
     ).scalar_one_or_none()
 
     if existing:
-        for field, val in data.model_dump(exclude={"track_id", "emitter_key", "emitter_mode"}).items():
+        for field, val in data.model_dump(exclude={"track_id", "emitter_mode"}).items():
             setattr(existing, field, val)
         db.commit()
         db.refresh(existing)
         return existing
 
-    emitter = EWTrackEmitter(**data.model_dump())
-    db.add(emitter)
+    record = EWTrackEmitter(**data.model_dump())
+    db.add(record)
     db.commit()
-    db.refresh(emitter)
-    return emitter
+    db.refresh(record)
+    return record
 
 def list_track_emitters(db: Session, track_id: uuid.UUID) -> list[EWTrackEmitter]:
     return db.execute(
         select(EWTrackEmitter).where(EWTrackEmitter.track_id == track_id)
     ).scalars().all()
+

@@ -19,10 +19,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 import uuid
 
 from app.core.database import Base
-from app.core.enum import ClassificationType, PlatformCategoryType
+from app.core.enum import Classification, PlatformCategoryType
 
 TZ    = TIMESTAMP(timezone=True)
-_cls  = SAEnum(ClassificationType,   name="classification_type",    create_type=False)
+_cls  = SAEnum(Classification,   name="classification_type",    create_type=False)
 _pcat = SAEnum(PlatformCategoryType, name="platform_category_type", create_type=False)
 
 
@@ -35,7 +35,7 @@ class TechPlatformInstance(Base):
     category:              Mapped[PlatformCategoryType | None] = mapped_column(_pcat, nullable=True)
     platform_country_code: Mapped[str | None]       = mapped_column(String(3),   nullable=True)
     platform_country_name: Mapped[str | None]       = mapped_column(String(128), nullable=True)
-    classification:        Mapped[ClassificationType] = mapped_column(_cls, nullable=False)
+    classification:        Mapped[Classification] = mapped_column(_cls, nullable=False)
     created_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
     updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
 
@@ -51,6 +51,18 @@ class TechSensor(Base):
     key:            Mapped[uuid.UUID]         = mapped_column(UUID(as_uuid=True), nullable=False, server_default=text("gen_random_uuid()"))
     name:           Mapped[str]               = mapped_column(String(255), nullable=False)
     type:           Mapped[str]               = mapped_column(String(128), nullable=False)
-    classification: Mapped[ClassificationType] = mapped_column(_cls, nullable=False)
+    classification: Mapped[Classification] = mapped_column(_cls, nullable=False)
+    created_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
+    updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
+
+
+class SensorCatalog(Base):
+    """Stub — sensor catalog referenced by EWTrackPointSensor."""
+    __tablename__ = "sensor_catalog"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
     created_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
     updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))

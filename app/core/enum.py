@@ -10,7 +10,7 @@ import enum
 
 # ── NEW: EW Track & Activity Report (schema v5.0) ─────────────────────────────
 
-class ClassificationType(str, enum.Enum):
+class Classification(str, enum.Enum):
     UNCLASSIFIED   = "UNCLASSIFIED"
     CUI            = "CUI"
     CONFIDENTIAL   = "CONFIDENTIAL"
@@ -19,33 +19,33 @@ class ClassificationType(str, enum.Enum):
 
 
 class SignalType(str, enum.Enum):
-    RADAR                 = "radar"
-    RADAR_PULSE           = "radar_pulse"
-    RADAR_CONTINUOUS_WAVE = "radar_continuous_wave"
-    COMMUNICATION         = "communication"
-    UNKNOWN               = "unknown"
+    RADAR                 = "RADAR"
+    RADAR_PULSE           = "RADAR_PULSE"
+    RADAR_CONTINUOUS_WAVE = "RADAR_CONTINUOUS_WAVE"
+    COMMUNICATION         = "COMMUNICATION"
+    UNKNOWN               = "UNKNOWN"
 
 
 class HostilityType(str, enum.Enum):
-    FRIENDLY          = "friendly"
-    HOSTILE           = "hostile"
-    NEUTRAL           = "neutral"
-    UNKNOWN           = "unknown"
-    AMBIGUOUS_SUSPECT = "ambiguous_suspect"
-    NO_LIBRARY_MATCH  = "no_library_match"
+    FRIENDLY          = "FRIENDLY"
+    HOSTILE           = "HOSTILE"
+    NEUTRAL           = "NEUTRAL"
+    UNKNOWN           = "UNKNOWN"
+    AMBIGUOUS_SUSPECT = "AMBIGUOUS_SUSPECT"
+    NO_LIBRARY_MATCH  = "NO_LIBRARY_MATCH"
 
 
 class PlatformCategoryType(str, enum.Enum):
-    AIRCRAFT   = "aircraft"
-    LAND       = "land"
-    SENSOR     = "sensor"
-    SUBSURFACE = "subsurface"
-    SURFACE    = "surface"
-    WEAPON     = "weapon"
-    UNKNOWN    = "unknown"
+    AIRCRAFT   = "AIRCRAFT"
+    LAND       = "LAND"
+    SENSOR     = "SENSOR"
+    SUBSURFACE = "SUBSURFACE"
+    SURFACE    = "SURFACE"
+    WEAPON     = "WEAPON"
+    UNKNOWN    = "UNKNOWN"
 
 
 class SensorRoleType(str, enum.Enum):
-    ORIGIN  = "origin"
-    CONFIRM = "confirm"
-    AUGMENT = "augment"
+    ORIGIN  = "ORIGIN"
+    CONFIRM = "CONFIRM"
+    AUGMENT = "AUGMENT"

@@ -29,7 +29,7 @@ def _track_payload(**overrides):
     return {
         "source_system": "Thor",
         "source_track_id": "TRK-001",
-        "hostility": "hostile",
+        "hostility": "HOSTILE",
         "classification": CLS,
         **overrides,
     }
@@ -45,17 +45,6 @@ def _point_payload(**overrides):
     }
 
 
-def _emitter_payload(emitter_key, **overrides):
-    return {
-        "emitter_key": emitter_key,
-        "first_seen_at": "2024-06-01T10:00:00Z",
-        "last_seen_at": "2024-06-01T10:30:00Z",
-        "signal_type": "radar",
-        "emitter_mode": "search",
-        **overrides,
-    }
-
-
 # ---------------------------------------------------------------------------
 # POST /ew/tracks
 # ---------------------------------------------------------------------------
@@ -67,7 +56,7 @@ class TestCreateTrack:
         assert resp.status_code == 201
         data = resp.json()
         assert data["source_system"] == "Thor"
-        assert data["hostility"] == "hostile"
+        assert data["hostility"] == "HOSTILE"
         assert data["classification"] == CLS
         assert data["id"] is not None
 
@@ -76,18 +65,13 @@ class TestCreateTrack:
         assert resp.status_code == 201
         assert resp.json()["mission_id"] == mission["id"]
 
-    def test_create_with_platform(self, client, platform):
-        resp = client.post(BASE, json=_track_payload(platform_id=platform["id"]))
-        assert resp.status_code == 201
-        assert resp.json()["platform_id"] == platform["id"]
-
     def test_create_duplicate_source_key_returns_409(self, client):
         client.post(BASE, json=_track_payload())
         resp = client.post(BASE, json=_track_payload())
         assert resp.status_code == 409
 
     def test_create_missing_source_system_returns_422(self, client):
-        resp = client.post(BASE, json={"hostility": "hostile", "classification": CLS})
+        resp = client.post(BASE, json={"hostility": "HOSTILE", "classification": CLS})
         assert resp.status_code == 422
 
     def test_create_missing_hostility_returns_422(self, client):
@@ -115,10 +99,10 @@ class TestUpsertTrack:
         assert resp.json()["id"] is not None
 
     def test_upsert_updates_existing(self, client):
-        client.post(f"{BASE}/upsert", json=_track_payload(hostility="friendly"))
-        resp = client.post(f"{BASE}/upsert", json=_track_payload(hostility="hostile"))
+        client.post(f"{BASE}/upsert", json=_track_payload(hostility="FRIENDLY"))
+        resp = client.post(f"{BASE}/upsert", json=_track_payload(hostility="HOSTILE"))
         assert resp.status_code == 200
-        assert resp.json()["hostility"] == "hostile"
+        assert resp.json()["hostility"] == "HOSTILE"
 
     def test_upsert_same_source_key_returns_same_id(self, client):
         r1 = client.post(f"{BASE}/upsert", json=_track_payload())
@@ -188,9 +172,9 @@ class TestListTracks:
 class TestUpdateTrack:
 
     def test_patch_hostility(self, client, ew_track):
-        resp = client.patch(f"{BASE}/{ew_track['id']}", json={"hostility": "friendly"})
+        resp = client.patch(f"{BASE}/{ew_track['id']}", json={"hostility": "FRIENDLY"})
         assert resp.status_code == 200
-        assert resp.json()["hostility"] == "friendly"
+        assert resp.json()["hostility"] == "FRIENDLY"
 
     def test_patch_classification(self, client, ew_track):
         resp = client.patch(f"{BASE}/{ew_track['id']}", json={"classification": "UNCLASSIFIED"})
@@ -209,7 +193,7 @@ class TestUpdateTrack:
     def test_patch_not_found_returns_404(self, client):
         resp = client.patch(
             f"{BASE}/00000000-0000-0000-0000-000000000000",
-            json={"hostility": "neutral"},
+            json={"hostility": "NEUTRAL"},
         )
         assert resp.status_code == 404
 
@@ -320,32 +304,32 @@ class TestTrackPoints:
 
 class TestTrackPointSensors:
 
-    def test_link_sensor_to_point_returns_201(self, client, track_point, sensor):
+    def test_link_sensor_to_point_returns_201(self, client, track_point, sensor_catalog):
         resp = client.post(
             f"/ew/points/{track_point['id']}/sensors",
-            json={"sensor_id": sensor["id"], "role": "origin"},
+            json={"sensor_catalog_id": sensor_catalog["id"], "role": "ORIGIN"},
         )
         assert resp.status_code == 201
         data = resp.json()
         assert data["point_id"] == track_point["id"]
-        assert data["sensor_id"] == sensor["id"]
+        assert data["sensor_catalog_id"] == sensor_catalog["id"]
 
-    def test_duplicate_sensor_link_returns_409(self, client, track_point, sensor):
+    def test_duplicate_sensor_link_returns_409(self, client, track_point, sensor_catalog):
         client.post(
             f"/ew/points/{track_point['id']}/sensors",
-            json={"sensor_id": sensor["id"]},
+            json={"sensor_catalog_id": sensor_catalog["id"]},
         )
         resp = client.post(
             f"/ew/points/{track_point['id']}/sensors",
-            json={"sensor_id": sensor["id"]},
+            json={"sensor_catalog_id": sensor_catalog["id"]},
         )
         assert resp.status_code == 409
 
-    def test_link_sensor_with_role(self, client, track_point, sensor):
-        for role in ("origin", "confirm", "augment"):
+    def test_link_sensor_with_role(self, client, track_point, sensor_catalog):
+        for role in ("ORIGIN", "CONFIRM", "AUGMENT"):
             resp = client.post(
                 f"/ew/points/{track_point['id']}/sensors",
-                json={"sensor_id": sensor["id"], "role": role},
+                json={"sensor_catalog_id": sensor_catalog["id"], "role": role},
             )
             # First succeeds; subsequent are duplicates (409 OK)
             assert resp.status_code in (201, 409)
@@ -356,42 +340,53 @@ class TestTrackPointSensors:
 # GET  /ew/tracks/{track_id}/emitters
 # ---------------------------------------------------------------------------
 
+def _emitter_payload(**overrides):
+    return {
+        "first_seen_at": "2024-06-01T10:00:00Z",
+        "last_seen_at":  "2024-06-01T10:30:00Z",
+        "signal_type":   "RADAR",
+        "emitter_mode":  "search",
+        **overrides,
+    }
+
+
 class TestTrackEmitters:
 
-    def test_upsert_emitter_creates_new(self, client, ew_track, emitter):
-        resp = client.post(
-            f"{BASE}/{ew_track['id']}/emitters",
-            json=_emitter_payload(emitter["key"]),
-        )
+    def test_upsert_emitter_creates_new(self, client, ew_track):
+        resp = client.post(f"{BASE}/{ew_track['id']}/emitters", json=_emitter_payload())
         assert resp.status_code == 201
         data = resp.json()
         assert data["track_id"] == ew_track["id"]
-        assert data["emitter_key"] == emitter["key"]
-        assert data["signal_type"] == "radar"
+        assert data["signal_type"] == "RADAR"
+        assert data["emitter_mode"] == "search"
 
-    def test_upsert_emitter_updates_existing(self, client, ew_track, emitter):
-        client.post(
-            f"{BASE}/{ew_track['id']}/emitters",
-            json=_emitter_payload(emitter["key"], emitter_confidence=0.5),
+    def test_upsert_emitter_with_identity_fields(self, client, ew_track):
+        payload = _emitter_payload(
+            emitter_id_sensor="42",
+            emitter_name="AN/ALQ-99",
+            emitter_country_code="USA",
+            emitter_country_name="United States",
         )
-        resp = client.post(
-            f"{BASE}/{ew_track['id']}/emitters",
-            json=_emitter_payload(emitter["key"], emitter_confidence=0.9),
-        )
+        resp = client.post(f"{BASE}/{ew_track['id']}/emitters", json=payload)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["emitter_name"] == "AN/ALQ-99"
+        assert data["emitter_country_code"] == "USA"
+        assert data["emitter_id_sensor"] == "42"
+
+    def test_upsert_emitter_updates_existing(self, client, ew_track):
+        client.post(f"{BASE}/{ew_track['id']}/emitters",
+                    json=_emitter_payload(emitter_confidence=0.5))
+        resp = client.post(f"{BASE}/{ew_track['id']}/emitters",
+                           json=_emitter_payload(emitter_confidence=0.9))
         assert resp.status_code == 201
         assert resp.json()["emitter_confidence"] == pytest.approx(0.9)
 
-    def test_upsert_emitter_with_rf_parameters(self, client, ew_track, emitter):
+    def test_upsert_emitter_with_rf_parameters(self, client, ew_track):
         payload = _emitter_payload(
-            emitter["key"],
-            freq_low_mhz=9000.0,
-            freq_high_mhz=9500.0,
-            freq_center_mhz=9250.0,
-            pulse_width_low_us=0.5,
-            pulse_width_center_us=1.0,
-            pri_low_us=1.0,
-            pri_high_us=2.0,
-            pri_center_us=1.5,
+            freq_low_mhz=9000.0, freq_high_mhz=9500.0, freq_center_mhz=9250.0,
+            pulse_width_low_us=0.5, pulse_width_center_us=1.0,
+            pri_low_us=1.0, pri_high_us=2.0, pri_center_us=1.5,
         )
         resp = client.post(f"{BASE}/{ew_track['id']}/emitters", json=payload)
         assert resp.status_code == 201
@@ -399,27 +394,24 @@ class TestTrackEmitters:
         assert data["freq_center_mhz"] == pytest.approx(9250.0)
         assert data["pri_center_us"] == pytest.approx(1.5)
 
-    def test_invalid_confidence_over_1_returns_422(self, client, ew_track, emitter):
-        payload = _emitter_payload(emitter["key"], emitter_confidence=1.5)
-        resp = client.post(f"{BASE}/{ew_track['id']}/emitters", json=payload)
+    def test_invalid_confidence_over_1_returns_422(self, client, ew_track):
+        resp = client.post(f"{BASE}/{ew_track['id']}/emitters",
+                           json=_emitter_payload(emitter_confidence=1.5))
         assert resp.status_code == 422
 
-    def test_invalid_confidence_negative_returns_422(self, client, ew_track, emitter):
-        payload = _emitter_payload(emitter["key"], emitter_confidence=-0.1)
-        resp = client.post(f"{BASE}/{ew_track['id']}/emitters", json=payload)
+    def test_invalid_confidence_negative_returns_422(self, client, ew_track):
+        resp = client.post(f"{BASE}/{ew_track['id']}/emitters",
+                           json=_emitter_payload(emitter_confidence=-0.1))
         assert resp.status_code == 422
 
-    def test_list_emitters_for_track(self, client, ew_track, emitter):
-        client.post(
-            f"{BASE}/{ew_track['id']}/emitters",
-            json=_emitter_payload(emitter["key"]),
-        )
+    def test_list_emitters_for_track(self, client, ew_track):
+        client.post(f"{BASE}/{ew_track['id']}/emitters", json=_emitter_payload())
         resp = client.get(f"{BASE}/{ew_track['id']}/emitters")
         assert resp.status_code == 200
         assert len(resp.json()) == 1
-        assert resp.json()[0]["emitter_key"] == emitter["key"]
 
     def test_list_emitters_empty_for_new_track(self, client, ew_track):
         resp = client.get(f"{BASE}/{ew_track['id']}/emitters")
         assert resp.status_code == 200
         assert resp.json() == []
+

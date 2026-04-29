@@ -34,8 +34,8 @@ def _report_payload(**overrides):
 def _instance_payload(activity_report_id, **overrides):
     return {
         "activity_report_id": activity_report_id,
-        "signal_type": "radar",
-        "hostility": "hostile",
+        "signal_type": "RADAR",
+        "hostility": "HOSTILE",
         "first_seen_dtg": "2024-06-01T10:00:00Z",
         "last_seen_dtg":  "2024-06-01T10:30:00Z",
         "last_position_longitude_dd": 54.3773,
@@ -208,8 +208,8 @@ class TestInstances:
         assert resp.status_code == 201
         data = resp.json()
         assert data["activity_report_id"] == activity_report["id"]
-        assert data["signal_type"] == "radar"
-        assert data["hostility"] == "hostile"
+        assert data["signal_type"] == "RADAR"
+        assert data["hostility"] == "HOSTILE"
 
     def test_add_instance_with_track_link(self, client, activity_report, ew_track):
         resp = client.post(
@@ -225,7 +225,7 @@ class TestInstances:
             emitter_name="AN/ALQ-99",
             emitter_confidence=0.85,
             emitter_country_code="RUS",
-            platform_category="aircraft",
+            platform_category="AIRCRAFT",
             platform_name="Su-35",
             platform_class="Flanker",
             last_position_error_m=100,
@@ -234,7 +234,7 @@ class TestInstances:
         assert resp.status_code == 201
         data = resp.json()
         assert data["emitter_name"] == "AN/ALQ-99"
-        assert data["platform_category"] == "aircraft"
+        assert data["platform_category"] == "AIRCRAFT"
 
     def test_duplicate_instance_for_same_track_returns_409(self, client, activity_report, ew_track):
         payload = _instance_payload(activity_report["id"], track_id=ew_track["id"])

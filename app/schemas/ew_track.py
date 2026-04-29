@@ -2,7 +2,7 @@
 app/schemas/ew_track.py
 Pydantic request/response schemas for EW Track endpoints.
 
-Mission and Emitter schemas live in app/schemas/common.py.
+Mission schemas live in app/schemas/common.py.
 Import them from there — do NOT redefine them here.
 """
 import uuid
@@ -11,7 +11,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from app.core.enum import (
-    ClassificationType,
+    Classification,
     HostilityType,
     PlatformCategoryType,
     SensorRoleType,
@@ -19,57 +19,7 @@ from app.core.enum import (
 )
 
 # Re-export so callers can still do a single import from this module if preferred
-from app.schemas.common import EmitterCreate, EmitterResponse, MissionCreate, MissionResponse  # noqa: F401
-
-
-# ---------------------------------------------------------------------------
-# Sensor
-# ---------------------------------------------------------------------------
-class SensorBase(BaseModel):
-    name:           str
-    type:           str
-    classification: ClassificationType
-
-class SensorCreate(SensorBase):
-    pass
-
-class SensorUpdate(BaseModel):
-    name:           Optional[str]               = None
-    type:           Optional[str]               = None
-    classification: Optional[ClassificationType] = None
-
-class SensorResponse(SensorBase):
-    key:        uuid.UUID           # public UUID identifier
-    created_at: datetime.datetime
-    updated_at: datetime.datetime
-    model_config = {"from_attributes": True}
-
-
-# ---------------------------------------------------------------------------
-# Platform
-# ---------------------------------------------------------------------------
-class PlatformBase(BaseModel):
-    name:                  Optional[str]                  = None
-    category:              Optional[PlatformCategoryType] = None
-    platform_country_code: Optional[str]                  = Field(None, max_length=3)
-    platform_country_name: Optional[str]                  = None
-    classification:        ClassificationType
-
-class PlatformCreate(PlatformBase):
-    pass
-
-class PlatformUpdate(BaseModel):
-    name:                  Optional[str]                  = None
-    category:              Optional[PlatformCategoryType] = None
-    platform_country_code: Optional[str]                  = Field(None, max_length=3)
-    platform_country_name: Optional[str]                  = None
-    classification:        Optional[ClassificationType]   = None
-
-class PlatformResponse(PlatformBase):
-    id:         int
-    created_at: datetime.datetime
-    updated_at: datetime.datetime
-    model_config = {"from_attributes": True}
+from app.schemas.common import MissionCreate, MissionResponse  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -77,21 +27,35 @@ class PlatformResponse(PlatformBase):
 # ---------------------------------------------------------------------------
 class EWTrackBase(BaseModel):
     source_system:   str
-    source_track_id: Optional[str] = None
+    source_track_id: Optional[str]       = None
     hostility:       HostilityType
-    classification:  ClassificationType
-    platform_id:     Optional[int] = None        # Integer FK → tech_platform_instance.id
+    classification:  Classification
     mission_id:      Optional[uuid.UUID] = None
+
+    # Platform snapshot (plain strings — no FK)
+    platform_id:           Optional[str]                  = None
+    platform_name:         Optional[str]                  = None
+    platform_class:        Optional[str]                  = None
+    platform_country_code: Optional[str]                  = Field(None, max_length=3)
+    platform_country_name: Optional[str]                  = None
+    platform_category:     Optional[PlatformCategoryType] = None
 
 class EWTrackCreate(EWTrackBase):
     pass
 
 class EWTrackUpdate(BaseModel):
     """Partial update — all fields optional."""
-    hostility:      Optional[HostilityType]      = None
-    classification: Optional[ClassificationType] = None
-    platform_id:    Optional[int]                = None  # Integer FK → tech_platform_instance.id
-    mission_id:     Optional[uuid.UUID]          = None
+    hostility:      Optional[HostilityType]  = None
+    classification: Optional[Classification] = None
+    mission_id:     Optional[uuid.UUID]      = None
+
+    # Platform snapshot (plain strings — no FK)
+    platform_id:           Optional[str]                  = None
+    platform_name:         Optional[str]                  = None
+    platform_class:        Optional[str]                  = None
+    platform_country_code: Optional[str]                  = Field(None, max_length=3)
+    platform_country_name: Optional[str]                  = None
+    platform_category:     Optional[PlatformCategoryType] = None
 
 class EWTrackResponse(EWTrackBase):
     id:         uuid.UUID
@@ -113,10 +77,10 @@ class EWTrackPointBase(BaseModel):
     lat:            float = Field(..., ge=-90,  le=90)
     lon:            float = Field(..., ge=-180, le=180)
     error_m:        Optional[float] = Field(None, ge=0)
-    classification: ClassificationType
+    classification: Classification
 
 class EWTrackPointCreate(EWTrackPointBase):
-    track_id: uuid.UUID
+    track_id: Optional[uuid.UUID] = None   # injected from path param by router
 
 class EWTrackPointResponse(EWTrackPointBase):
     id:       uuid.UUID
@@ -128,12 +92,15 @@ class EWTrackPointResponse(EWTrackPointBase):
 # EWTrackPointSensor
 # ---------------------------------------------------------------------------
 class EWTrackPointSensorCreate(BaseModel):
-    point_id:  uuid.UUID
-    sensor_id: int                          # Integer FK → tech_sensor.id
-    role:      Optional[SensorRoleType] = None
+    point_id:          Optional[uuid.UUID] = None  # injected from path param by router
+    sensor_catalog_id: uuid.UUID                   # FK → sensor_catalog.id
+    role:              Optional[SensorRoleType] = None
 
-class EWTrackPointSensorResponse(EWTrackPointSensorCreate):
-    id: uuid.UUID
+class EWTrackPointSensorResponse(BaseModel):
+    id:                uuid.UUID
+    point_id:          uuid.UUID
+    sensor_catalog_id: uuid.UUID
+    role:              Optional[SensorRoleType] = None
     model_config = {"from_attributes": True}
 
 
@@ -141,6 +108,12 @@ class EWTrackPointSensorResponse(EWTrackPointSensorCreate):
 # EWTrackEmitter
 # ---------------------------------------------------------------------------
 class EWTrackEmitterBase(BaseModel):
+    # Emitter identity (plain strings — no FK)
+    emitter_id_sensor:    Optional[str]   = None
+    emitter_name:         Optional[str]   = None
+    emitter_country_code: Optional[str]   = Field(None, max_length=3)
+    emitter_country_name: Optional[str]   = None
+
     first_seen_at:      datetime.datetime
     last_seen_at:       datetime.datetime
     emitter_confidence: Optional[float] = Field(None, ge=0, le=1)
@@ -163,15 +136,13 @@ class EWTrackEmitterBase(BaseModel):
     pri_center_us: Optional[float] = None
 
 class EWTrackEmitterCreate(EWTrackEmitterBase):
-    track_id:    uuid.UUID
-    emitter_key: uuid.UUID
+    track_id: Optional[uuid.UUID] = None  # injected from path param by router
 
 class EWTrackEmitterResponse(EWTrackEmitterBase):
-    id:          uuid.UUID
-    track_id:    uuid.UUID
-    emitter_key: uuid.UUID
-    created_at:  datetime.datetime
-    updated_at:  datetime.datetime
+    id:         uuid.UUID
+    track_id:   uuid.UUID
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
     model_config = {"from_attributes": True}
 
 
