@@ -49,3 +49,27 @@ class SensorRoleType(str, enum.Enum):
     ORIGIN  = "ORIGIN"
     CONFIRM = "CONFIRM"
     AUGMENT = "AUGMENT"
+
+
+class SensorType(str, enum.Enum):
+    RADAR    = "RADAR"
+    ELINT    = "ELINT"
+    SIGINT   = "SIGINT"
+    EO_IR    = "EO_IR"
+    ACOUSTIC = "ACOUSTIC"
+    OTHER    = "OTHER"
+
+
+class SensorStatusType(str, enum.Enum):
+    ACTIVE      = "ACTIVE"
+    INACTIVE    = "INACTIVE"
+    DEGRADED    = "DEGRADED"
+    OFFLINE     = "OFFLINE"
+    MAINTENANCE = "MAINTENANCE"
+
+
+class SensorSourceType(str, enum.Enum):
+    MANUAL    = "MANUAL"
+    AUTOMATED = "AUTOMATED"
+    FEED      = "FEED"
+    API       = "API"

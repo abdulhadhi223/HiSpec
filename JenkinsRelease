@@ -1,0 +1,120 @@
+stage('Nutanix: Clone or Reuse VM') {
+    steps {
+        withCredentials([usernamePassword(
+            credentialsId: 'nutanix_api_key',
+            usernameVariable: 'NTNX_KEY',
+            passwordVariable: 'NTNX_SECRET'
+        )]) {
+            script {
+
+                // ---------- 1. Check if VM already exists ----------
+                def existingUUID = sh(
+                    script: """
+                        curl -sk -X POST \\
+                          -H 'Accept: application/json' \\
+                          -H 'Content-Type: application/json' \\
+                          -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
+                          'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms?\\$filter=name eq \\'${VM_NAME}\\'' \\
+                        | python3 -c '
+import sys, json
+data = json.load(sys.stdin)
+vms = data.get("data", [])
+print(vms[0].get("extId", "") if vms else "")
+'
+                    """,
+                    returnStdout: true
+                ).trim()
+
+                if (!existingUUID) {
+
+                    // ---------- 2. Get ETag from template ----------
+                    def etagResult = sh(
+                        script: """
+                            curl -sk -X GET \\
+                              -H 'Accept: application/json' \\
+                              -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
+                              -D - \\
+                              'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms/${params.PC_TEMPLATE_VM_UUID}' \\
+                            | grep -i ETag | awk '{print \$2}' | tr -d '\\r'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    // ---------- 3. Clone VM from template ----------
+                    def reqId = UUID.randomUUID().toString()
+
+                    sh """
+                        curl -sk -X POST \\
+                          -H 'Accept: application/json' \\
+                          -H 'Content-Type: application/json' \\
+                          -H 'If-Match: ${etagResult}' \\
+                          -H 'NTNX-Request-Id: ${reqId}' \\
+                          -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
+                          -d '{"name": "${VM_NAME}"}' \\
+                          'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms/${params.PC_TEMPLATE_VM_UUID}/\$actions/clone'
+                    """
+
+                    sleep 10
+
+                    // ---------- 4. Get new VM UUID ----------
+                    existingUUID = sh(
+                        script: """
+                            curl -sk -X GET \\
+                              -H 'Accept: application/json' \\
+                              -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
+                              'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms?\\$filter=name eq \\'${VM_NAME}\\'' \\
+                            | python3 -c '
+import sys, json
+data = json.load(sys.stdin)
+vms = data.get("data", [])
+print(vms[0].get("extId", "") if vms else "")
+'
+                        """,
+                        returnStdout: true
+                    ).trim()
+                }
+
+                // ---------- 5. Power on VM ----------
+                def powerReqId = UUID.randomUUID().toString()
+                sh """
+                    curl -sk -X POST \\
+                      -H 'Accept: application/json' \\
+                      -H 'Content-Type: application/json' \\
+                      -H 'NTNX-Request-Id: ${powerReqId}' \\
+                      -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
+                      'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms/${existingUUID}/\$actions/power-on'
+                """
+
+                // ---------- 6. Wait for IP ----------
+                def vmIP = ""
+                timeout(time: 8, unit: 'MINUTES') {
+                    waitUntil {
+                        vmIP = sh(
+                            script: """
+                                curl -sk -X GET \\
+                                  -H 'Accept: application/json' \\
+                                  -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
+                                  'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms/${existingUUID}/nics' \\
+                                | python3 -c '
+import sys, json, re
+data = json.load(sys.stdin)
+nics = data.get("data", [])
+for nic in nics:
+    for ep in nic.get("networkInfo", {}).get("ipv4Info", {}).get("learnedIpAddresses", []):
+        ip = ep.get("value", "")
+        if re.fullmatch(r"[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+", ip):
+            print(ip)
+            break
+'
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        return vmIP != ""
+                    }
+                }
+
+                env.TARGET_VM_IP = vmIP
+            }
+        }
+    }
+}

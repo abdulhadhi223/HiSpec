@@ -31,6 +31,7 @@ class TechPlatformInstance(Base):
     __tablename__ = "tech_platform_instance"
 
     id:                    Mapped[int]             = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entity_id:             Mapped[str | None]       = mapped_column(String(50), nullable=True, unique=True, index=True)
     name:                  Mapped[str | None]       = mapped_column(String(255), nullable=True)
     category:              Mapped[PlatformCategoryType | None] = mapped_column(_pcat, nullable=True)
     platform_country_code: Mapped[str | None]       = mapped_column(String(3),   nullable=True)
@@ -56,13 +57,3 @@ class TechSensor(Base):
     updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
 
 
-class SensorCatalog(Base):
-    """Stub — sensor catalog referenced by EWTrackPointSensor."""
-    __tablename__ = "sensor_catalog"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True,
-        server_default=text("gen_random_uuid()"),
-    )
-    created_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
-    updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))

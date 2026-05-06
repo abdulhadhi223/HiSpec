@@ -21,20 +21,27 @@ from app.core.enum import (
     HostilityType,
     PlatformCategoryType,
     SensorRoleType,
+    SensorSourceType,
+    SensorStatusType,
+    SensorType,
     SignalType,
 )
 
 # Register all models so Base.metadata includes every table
-import app.models.orm_models       # noqa: F401
-import app.models.common_models    # noqa: F401
-import app.models.ew_track_models  # noqa: F401
+import app.models.orm_models            # noqa: F401
+import app.models.common_models         # noqa: F401
+import app.models.ew_track_models       # noqa: F401
+import app.models.sensor_status_models  # noqa: F401
 
 _ENUM_TYPES = [
-    ("classification_type", Classification),
-    ("signal_type", SignalType),
-    ("hostility_type", HostilityType),
-    ("platform_category_type", PlatformCategoryType),
-    ("sensor_role_type", SensorRoleType),
+    ("classification_type",      Classification),
+    ("signal_type",              SignalType),
+    ("hostility_type",           HostilityType),
+    ("platform_category_type",   PlatformCategoryType),
+    ("sensor_role_type",         SensorRoleType),
+    ("sensor_type_enum",         SensorType),
+    ("sensor_status_enum",       SensorStatusType),
+    ("sensor_status_source_enum", SensorSourceType),
 ]
 
 
@@ -51,6 +58,11 @@ def setup_database():
                 f"  END IF; "
                 f"END $$;"
             ))
+        # entity_id is on the real TechPlatformInstance but not in the migration stub
+        conn.execute(text(
+            "ALTER TABLE tech_platform_instance "
+            "ADD COLUMN IF NOT EXISTS entity_id VARCHAR(50) UNIQUE;"
+        ))
     Base.metadata.create_all(bind=engine, checkfirst=True)
     yield
     # Tables intentionally NOT dropped — keep schema in place for inspection
@@ -101,12 +113,12 @@ CLASSIFICATION = "SECRET"
 @pytest.fixture()
 def sensor_catalog(db):
     """SensorCatalog — used by EWTrackPointSensor tests."""
-    from app.models.orm_models import SensorCatalog
-    entry = SensorCatalog()
-    db.add(entry)
+    import uuid as _uuid
+    from sqlalchemy import text
+    new_id = _uuid.uuid4()
+    db.execute(text("INSERT INTO sensor_catalog (id) VALUES (:id)"), {"id": new_id})
     db.commit()
-    db.refresh(entry)
-    return {"id": str(entry.id)}
+    return {"id": str(new_id)}
 
 
 @pytest.fixture()

@@ -69,10 +69,13 @@ class Mission(Base):
     created_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
     updated_at = mapped_column(TZ, nullable=False, server_default=text("now()"))
 
-    # Back-refs — populated by relationships defined in ew_track_models.py
+    # Back-refs — populated by relationships defined in ew_track_models.py and sensor_status_models.py
     ew_tracks: Mapped[list["EWTrack"]] = relationship(
         "EWTrack", back_populates="mission"
     )
     activity_report_missions: Mapped[list["ActivityReportMission"]] = relationship(
         "ActivityReportMission", back_populates="mission"
+    )
+    mission_platform: Mapped[list["MissionPlatform"]] = relationship(
+        "MissionPlatform", back_populates="mission"
     )
