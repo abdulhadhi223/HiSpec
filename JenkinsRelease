@@ -30,16 +30,8 @@ pipeline {
 
         // Shared PostgreSQL for branch schemas
         DB_HOST          = '10.192.26.4'
-        DB_PORT          = '5432'
+        DB_PORT          = '8080'
         DB_NAME          = 'nmdb_dev'
-
-        BRANCH_SLUG = """\
-${
-    params.SOURCE_BRANCH
-        .replaceAll('^origin/', '')
-        .replaceAll('[^a-zA-Z0-9-]', '-')
-        .toLowerCase()
-}"""
     }
 
     stages {
@@ -50,9 +42,10 @@ ${
         stage('Resolve VM Name / FQDN') {
             steps {
                 script {
+                    // Use underscore for schema names (no hyphens)
                     def slug = params.SOURCE_BRANCH
                         .replaceAll('^origin/', '')
-                        .replaceAll('[^a-zA-Z0-9-]', '-')
+                        .replaceAll('[^a-zA-Z0-9]', '_')
                         .toLowerCase()
 
                     env.BRANCH_SLUG    = slug
@@ -62,6 +55,10 @@ ${
                     env.TLS_DIR        = "/opt/docker-tls/${env.VM_NAME}"
                     env.CONTAINER_NAME = "${env.VM_NAME}"
                     env.DEV_SCHEMA     = "dev_${slug}"
+
+                    echo "BRANCH_SLUG=${env.BRANCH_SLUG}"
+                    echo "VM_NAME=${env.VM_NAME}"
+                    echo "DEV_SCHEMA=${env.DEV_SCHEMA}"
                 }
             }
         }
@@ -80,7 +77,6 @@ ${
                         def ip = sh(returnStdout: true, script: '''
                             set -euo pipefail
                             PC="https://${PC_HOST}:9440"
-                            AUTH="${NTNX_KEY}:${NTNX_SECRET}"
                             NAME="${VM_NAME}"
                             TEMPLATE_UUID="${PC_TEMPLATE_VM_UUID}"
 
@@ -91,6 +87,7 @@ ${
                                 -X POST "$PC/api/nutanix/v3/vms/list" \
                                 -d '{"kind":"vm","length":500}')
 
+                            # ── find_vm.py ──────────────────────────────
                             cat > /tmp/find_vm.py << 'EOF'
 import sys, json, os
 d = json.load(sys.stdin)
@@ -104,13 +101,39 @@ elif mode == 'uuid':
     print(ents[0].get('metadata', {}).get('uuid', '') if ents else '')
 EOF
 
+                            # ── get_ip.py ───────────────────────────────
+                            cat > /tmp/get_ip.py << 'EOF'
+import sys, json, re
+d = json.load(sys.stdin)
+def valid(ip):
+    return (isinstance(ip, str) and
+            re.match(r"^\d+\.\d+\.\d+\.\d+$", ip) and
+            not ip.startswith(("127.", "169.254.", "172.17.")))
+nics = (d.get("status", {}) or {}).get("resources", {}).get("nic_list", []) or []
+candidates = []
+for n in nics:
+    for ep in (n.get("ip_endpoint_list", []) or []):
+        candidates.append(ep.get("ip", ""))
+    candidates.append(n.get("ip_address", ""))
+snics = (d.get("spec", {}) or {}).get("resources", {}).get("nic_list", []) or []
+for n in snics:
+    for ep in (n.get("ip_endpoint_list", []) or []):
+        candidates.append(ep.get("ip", ""))
+    candidates.append(n.get("ip_address", ""))
+for ip in candidates:
+    if valid(ip):
+        print(ip)
+        raise SystemExit(0)
+raise SystemExit(1)
+EOF
+
                             COUNT=$(echo "$RESP" | FIND_MODE=count VM_NAME="$NAME" python3 /tmp/find_vm.py)
                             UUID=$(echo  "$RESP" | FIND_MODE=uuid  VM_NAME="$NAME" python3 /tmp/find_vm.py)
 
                             echo "DEBUG: VM name=$NAME count=$COUNT uuid=$UUID" >&2
 
                             if [ "$COUNT" -gt 1 ]; then
-                                echo "ERROR: Multiple VMs exist with name=$NAME. Remove duplicates in Prism." >&2
+                                echo "ERROR: Multiple VMs with name=$NAME. Remove duplicates in Prism." >&2
                                 exit 2
                             fi
 
@@ -129,8 +152,10 @@ print(d.get("status",{}).get("execution_context",{}).get("task_uuid") or d.get("
 
                                 UUID=""
                                 for i in $(seq 1 240); do
-                                    T=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" "$PC/api/nutanix/v3/tasks/$TASK")
-                                    S=$(echo "$T" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status",""))')
+                                    T=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" \
+                                        "$PC/api/nutanix/v3/tasks/$TASK")
+                                    S=$(echo "$T" | python3 -c \
+                                        'import sys,json; d=json.load(sys.stdin); print(d.get("status",""))')
                                     if [ "$S" = "SUCCEEDED" ]; then
                                         UUID=$(echo "$T" | python3 -c 'import sys,json
 d=json.load(sys.stdin)
@@ -154,7 +179,8 @@ for e in d.get("entity_reference_list",[]) or []:
                                 -H 'Content-Type: application/json' \
                                 -X GET "$PC/api/nutanix/v3/vms/${UUID}")
 
-                            CUR_PWR=$(echo "$VM_GET" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(((d.get("status") or {}).get("resources") or {}).get("power_state",""))')
+                            CUR_PWR=$(echo "$VM_GET" | python3 -c \
+                                'import sys,json; d=json.load(sys.stdin); print(((d.get("status") or {}).get("resources") or {}).get("power_state",""))')
 
                             if [ "$CUR_PWR" != "ON" ]; then
                                 VM_PUT=$(echo "$VM_GET" | python3 -c 'import sys,json
@@ -178,8 +204,10 @@ print(d.get("status",{}).get("execution_context",{}).get("task_uuid") or d.get("
                                 [ -n "$PTASK" ] || { echo "ERROR: no task_uuid from power on" >&2; exit 1; }
 
                                 for i in $(seq 1 120); do
-                                    TT=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" "$PC/api/nutanix/v3/tasks/$PTASK")
-                                    SS=$(echo "$TT" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status",""))')
+                                    TT=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" \
+                                        "$PC/api/nutanix/v3/tasks/$PTASK")
+                                    SS=$(echo "$TT" | python3 -c \
+                                        'import sys,json; d=json.load(sys.stdin); print(d.get("status",""))')
                                     [ "$SS" = "SUCCEEDED" ] && break
                                     [ "$SS" = "FAILED" ] && { echo "ERROR: power on failed" >&2; exit 1; }
                                     sleep 2
@@ -188,28 +216,13 @@ print(d.get("status",{}).get("execution_context",{}).get("task_uuid") or d.get("
                                 echo "VM already ON - skipping power-on task" >&2
                             fi
 
+                            # ── Poll for DHCP IP (uses /tmp/get_ip.py written above) ──
                             for i in $(seq 1 240); do
                                 VM_GET=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" \
                                     -H 'Content-Type: application/json' \
                                     -X GET "$PC/api/nutanix/v3/vms/${UUID}")
 
-                                IP=$(echo "$VM_GET" | python3 -c '
-import sys,json,re
-d=json.load(sys.stdin)
-def valid(ip):
-    return isinstance(ip,str) and re.match(r"^\\d+\\.\\d+\\.\\d+\\.\\d+$",ip) and not ip.startswith(("127.","169.254.","172.17."))
-nics=(d.get("status",{}) or {}).get("resources",{}).get("nic_list",[]) or []
-candidates=[]
-for n in nics:
-    for ep in (n.get("ip_endpoint_list",[]) or []):
-        candidates.append(ep.get("ip",""))
-for n in nics:
-    candidates.append(n.get("ip_address",""))
-for ip in candidates:
-    if valid(ip):
-        print(ip); raise SystemExit(0)
-raise SystemExit(1)
-' 2>/dev/null || true
+                                IP=$(echo "$VM_GET" | python3 /tmp/get_ip.py 2>/dev/null || true)
 
                                 [ -n "$IP" ] && { echo "$IP"; exit 0; }
                                 sleep 5
@@ -227,7 +240,7 @@ raise SystemExit(1)
         }
 
         // ----------------------------------------------------------------
-        // NEW: Provision dev schema on shared PostgreSQL
+        // Provision dev schema on shared PostgreSQL
         // ----------------------------------------------------------------
         stage('Provision Dev Schema') {
             steps {
@@ -246,7 +259,12 @@ raise SystemExit(1)
                     sh '''
                         set -euo pipefail
 
-                        export DB_ADMIN_URL="postgresql://${DB_ADMIN_USER}:${DB_ADMIN_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+                        # Pass individual params — avoids URL special char issues
+                        export DB_HOST="${DB_HOST}"
+                        export DB_PORT="${DB_PORT}"
+                        export DB_NAME="${DB_NAME}"
+                        export DB_ADMIN_USER="${DB_ADMIN_USER}"
+                        export DB_ADMIN_PASS="${DB_ADMIN_PASS}"
                         export DB_APP_USER="${NMDB_APP_USER}"
 
                         # Idempotent — safe to re-run on existing branch
@@ -259,7 +277,7 @@ raise SystemExit(1)
         }
 
         // ----------------------------------------------------------------
-        // NEW: Run Alembic migrations on dev schema
+        // Run Alembic migrations on dev schema
         // ----------------------------------------------------------------
         stage('Migrate Dev Schema') {
             steps {
@@ -273,7 +291,12 @@ raise SystemExit(1)
                     sh '''
                         set -euo pipefail
 
-                        export DATABASE_URL="postgresql://${NMDB_APP_USER}:${NMDB_APP_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}?options=-csearch_path=${DEV_SCHEMA}"
+                        # URL-encode password to handle special characters
+                        ENCODED_PASS=$(python3 -c \
+                            "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" \
+                            "${NMDB_APP_PASS}")
+
+                        export DATABASE_URL="postgresql://${NMDB_APP_USER}:${ENCODED_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}?options=-csearch_path=${DEV_SCHEMA}"
 
                         alembic upgrade head
 
@@ -449,8 +472,13 @@ EOT
 
                         FULL_IMAGE="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}"
 
-                        # Construct the DATABASE_URL for this branch's schema
-                        DB_URL="postgresql://${NMDB_APP_USER}:${NMDB_APP_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}?options=-csearch_path=${DEV_SCHEMA}"
+                        # URL-encode password to handle special characters
+                        ENCODED_PASS=$(python3 -c \
+                            "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" \
+                            "${NMDB_APP_PASS}")
+
+                        # Construct DATABASE_URL for this branch schema
+                        DB_URL="postgresql://${NMDB_APP_USER}:${ENCODED_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}?options=-csearch_path=${DEV_SCHEMA}"
 
                         echo "Deploying ${FULL_IMAGE} → ${TARGET_VM_IP} (${VM_NAME})"
                         echo "Schema: ${DEV_SCHEMA}"
