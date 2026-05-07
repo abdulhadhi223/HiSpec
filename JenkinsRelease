@@ -1,119 +1,496 @@
-stage('Nutanix: Clone or Reuse VM') {
-    steps {
-        withCredentials([usernamePassword(
-            credentialsId: 'nutanix_api_key',
-            usernameVariable: 'NTNX_KEY',
-            passwordVariable: 'NTNX_SECRET'
-        )]) {
-            script {
+pipeline {
+    agent { label 'newsc-agent-1' }
 
-                // ---------- 1. Check if VM already exists ----------
-                def existingUUID = sh(
-                    script: """
-                        curl -sk -X POST \\
-                          -H 'Accept: application/json' \\
-                          -H 'Content-Type: application/json' \\
-                          -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
-                          'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms?\\$filter=name eq \\'${VM_NAME}\\'' \\
-                        | python3 -c '
-import sys, json
-data = json.load(sys.stdin)
-vms = data.get("data", [])
-print(vms[0].get("extId", "") if vms else "")
-'
-                    """,
-                    returnStdout: true
-                ).trim()
+    options {
+        skipDefaultCheckout(true)
+    }
 
-                if (!existingUUID) {
+    parameters {
+        string(name: 'IMAGE_TAG',            defaultValue: 'latest')
+        string(name: 'HOST_PORT',            defaultValue: '8080')
+        string(name: 'CONTAINER_PORT',       defaultValue: '8080')
+        string(name: 'DOCKER_TLS_PORT',      defaultValue: '2376')
 
-                    // ---------- 2. Get ETag from template ----------
-                    def etagResult = sh(
-                        script: """
-                            curl -sk -X GET \\
-                              -H 'Accept: application/json' \\
-                              -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
-                              -D - \\
-                              'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms/${params.PC_TEMPLATE_VM_UUID}' \\
-                            | grep -i ETag | awk '{print \$2}' | tr -d '\\r'
-                        """,
-                        returnStdout: true
-                    ).trim()
+        string(name: 'PC_HOST',              defaultValue: '10.192.24.59')
+        string(name: 'PC_CLUSTER_UUID',      defaultValue: '000649fa-1fc5-7223-35cf-5e8aca40ad3b')
+        string(name: 'PC_SUBNET_UUID',       defaultValue: '28f2fbf8-b8bf-4eac-827f-889d94acd99d')
+        string(name: 'PC_TEMPLATE_VM_UUID',  defaultValue: 'a915b4cf-7bf3-4eef-851e-9b8d46a9179f')
 
-                    // ---------- 3. Clone VM from template ----------
-                    def reqId = UUID.randomUUID().toString()
+        string(name: 'VM_FQDN_SUFFIX',      defaultValue: '.mcore')
+        string(name: 'SOURCE_BRANCH',       defaultValue: 'main')
+        string(name: 'GIT_COMMIT',          defaultValue: '')
+    }
 
-                    sh """
-                        curl -sk -X POST \\
-                          -H 'Accept: application/json' \\
-                          -H 'Content-Type: application/json' \\
-                          -H 'If-Match: ${etagResult}' \\
-                          -H 'NTNX-Request-Id: ${reqId}' \\
-                          -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
-                          -d '{"name": "${VM_NAME}"}' \\
-                          'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms/${params.PC_TEMPLATE_VM_UUID}/\$actions/clone'
-                    """
+    environment {
+        HARBOR_CRED_ID   = 'Harbor'
+        HARBOR_REGISTRY  = '10.192.26.160:80'
+        HARBOR_PROJECT   = 'newsc'
+        IMAGE_NAME       = 'nmdb-app'
+        DOCKER_CA_DIR    = '/opt/docker-ca'
 
-                    sleep 10
+        // Shared PostgreSQL for branch schemas
+        DB_HOST          = '10.192.26.4'
+        DB_PORT          = '5432'
+        DB_NAME          = 'nmdb_dev'
 
-                    // ---------- 4. Get new VM UUID ----------
-                    existingUUID = sh(
-                        script: """
-                            curl -sk -X GET \\
-                              -H 'Accept: application/json' \\
-                              -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
-                              'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms?\\$filter=name eq \\'${VM_NAME}\\'' \\
-                            | python3 -c '
-import sys, json
-data = json.load(sys.stdin)
-vms = data.get("data", [])
-print(vms[0].get("extId", "") if vms else "")
-'
-                        """,
-                        returnStdout: true
-                    ).trim()
+        BRANCH_SLUG = """\
+${
+    params.SOURCE_BRANCH
+        .replaceAll('^origin/', '')
+        .replaceAll('[^a-zA-Z0-9-]', '-')
+        .toLowerCase()
+}"""
+    }
+
+    stages {
+
+        // ----------------------------------------------------------------
+        // Resolve VM name and all path variables
+        // ----------------------------------------------------------------
+        stage('Resolve VM Name / FQDN') {
+            steps {
+                script {
+                    def slug = params.SOURCE_BRANCH
+                        .replaceAll('^origin/', '')
+                        .replaceAll('[^a-zA-Z0-9-]', '-')
+                        .toLowerCase()
+
+                    env.BRANCH_SLUG    = slug
+                    env.VM_NAME        = "nmdb-${slug}"
+                    env.VM_FQDN        = "${env.VM_NAME}.mcore"
+                    env.CERT_OUT_DIR   = "${env.DOCKER_CA_DIR}/generated/${env.VM_NAME}"
+                    env.TLS_DIR        = "/opt/docker-tls/${env.VM_NAME}"
+                    env.CONTAINER_NAME = "${env.VM_NAME}"
+                    env.DEV_SCHEMA     = "dev_${slug}"
                 }
+            }
+        }
 
-                // ---------- 5. Power on VM ----------
-                def powerReqId = UUID.randomUUID().toString()
-                sh """
-                    curl -sk -X POST \\
-                      -H 'Accept: application/json' \\
-                      -H 'Content-Type: application/json' \\
-                      -H 'NTNX-Request-Id: ${powerReqId}' \\
-                      -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
-                      'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms/${existingUUID}/\$actions/power-on'
-                """
+        // ----------------------------------------------------------------
+        // Nutanix: find or clone VM, power on, wait for DHCP IP
+        // ----------------------------------------------------------------
+        stage('Nutanix: Ensure VM exists and Get IP') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'nutanix_api_key',
+                    usernameVariable: 'NTNX_KEY',
+                    passwordVariable: 'NTNX_SECRET'
+                )]) {
+                    script {
+                        def ip = sh(returnStdout: true, script: '''
+                            set -euo pipefail
+                            PC="https://${PC_HOST}:9440"
+                            AUTH="${NTNX_KEY}:${NTNX_SECRET}"
+                            NAME="${VM_NAME}"
+                            TEMPLATE_UUID="${PC_TEMPLATE_VM_UUID}"
 
-                // ---------- 6. Wait for IP ----------
-                def vmIP = ""
-                timeout(time: 8, unit: 'MINUTES') {
-                    waitUntil {
-                        vmIP = sh(
-                            script: """
-                                curl -sk -X GET \\
-                                  -H 'Accept: application/json' \\
-                                  -H 'Authorization: ApiKey ${NTNX_SECRET}' \\
-                                  'https://${PC_HOST}:9440/api/vmm/v4.0/ahv/config/vms/${existingUUID}/nics' \\
-                                | python3 -c '
-import sys, json, re
-data = json.load(sys.stdin)
-nics = data.get("data", [])
-for nic in nics:
-    for ep in nic.get("networkInfo", {}).get("ipv4Info", {}).get("learnedIpAddresses", []):
-        ip = ep.get("value", "")
-        if re.fullmatch(r"[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+", ip):
-            print(ip)
-            break
-'
-                            """,
-                            returnStdout: true
-                        ).trim()
-                        return vmIP != ""
+                            echo "Target VM name: ${NAME}" >&2
+
+                            RESP=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" \
+                                -H 'Content-Type: application/json' \
+                                -X POST "$PC/api/nutanix/v3/vms/list" \
+                                -d '{"kind":"vm","length":500}')
+
+                            cat > /tmp/find_vm.py << 'EOF'
+import sys, json, os
+d = json.load(sys.stdin)
+name = os.environ['VM_NAME']
+ents = [e for e in (d.get('entities') or [])
+        if (e.get('status') or e.get('spec') or {}).get('name') == name]
+mode = os.environ.get('FIND_MODE', 'count')
+if mode == 'count':
+    print(len(ents))
+elif mode == 'uuid':
+    print(ents[0].get('metadata', {}).get('uuid', '') if ents else '')
+EOF
+
+                            COUNT=$(echo "$RESP" | FIND_MODE=count VM_NAME="$NAME" python3 /tmp/find_vm.py)
+                            UUID=$(echo  "$RESP" | FIND_MODE=uuid  VM_NAME="$NAME" python3 /tmp/find_vm.py)
+
+                            echo "DEBUG: VM name=$NAME count=$COUNT uuid=$UUID" >&2
+
+                            if [ "$COUNT" -gt 1 ]; then
+                                echo "ERROR: Multiple VMs exist with name=$NAME. Remove duplicates in Prism." >&2
+                                exit 2
+                            fi
+
+                            if [ -z "$UUID" ]; then
+                                echo "VM not found. Cloning from template $TEMPLATE_UUID" >&2
+                                CLONE=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" \
+                                    -H 'Content-Type: application/json' \
+                                    -X POST "$PC/api/nutanix/v3/vms/${TEMPLATE_UUID}/clone" \
+                                    -d "{ \\"override_spec\\": { \\"name\\": \\"${NAME}\\" } }")
+
+                                TASK=$(echo "$CLONE" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+print(d.get("status",{}).get("execution_context",{}).get("task_uuid") or d.get("task_uuid") or "")')
+
+                                [ -n "$TASK" ] || { echo "ERROR: no task_uuid from clone" >&2; exit 1; }
+
+                                UUID=""
+                                for i in $(seq 1 240); do
+                                    T=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" "$PC/api/nutanix/v3/tasks/$TASK")
+                                    S=$(echo "$T" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status",""))')
+                                    if [ "$S" = "SUCCEEDED" ]; then
+                                        UUID=$(echo "$T" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+tpl="${PC_TEMPLATE_VM_UUID}"
+for e in d.get("entity_reference_list",[]) or []:
+    if e.get("kind")=="vm" and e.get("uuid") and e.get("uuid") != tpl:
+        print(e["uuid"]); break')
+                                        break
+                                    fi
+                                    [ "$S" = "FAILED" ] && { echo "ERROR: clone failed" >&2; exit 1; }
+                                    sleep 2
+                                done
+
+                                [ -n "$UUID" ] || { echo "ERROR: could not derive new VM UUID" >&2; exit 1; }
+                                echo "Cloned VM UUID=${UUID}" >&2
+                            else
+                                echo "Reusing existing VM UUID=${UUID}" >&2
+                            fi
+
+                            VM_GET=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" \
+                                -H 'Content-Type: application/json' \
+                                -X GET "$PC/api/nutanix/v3/vms/${UUID}")
+
+                            CUR_PWR=$(echo "$VM_GET" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(((d.get("status") or {}).get("resources") or {}).get("power_state",""))')
+
+                            if [ "$CUR_PWR" != "ON" ]; then
+                                VM_PUT=$(echo "$VM_GET" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+out={}
+out["api_version"]=d.get("api_version","3.1")
+out["metadata"]=d.get("metadata",{})
+out["spec"]=d.get("spec",{})
+out.setdefault("spec",{}).setdefault("resources",{})["power_state"]="ON"
+print(json.dumps(out))')
+
+                                PWR=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" \
+                                    -H 'Content-Type: application/json' \
+                                    -X PUT "$PC/api/nutanix/v3/vms/${UUID}" \
+                                    -d "$VM_PUT")
+
+                                PTASK=$(echo "$PWR" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+print(d.get("status",{}).get("execution_context",{}).get("task_uuid") or d.get("task_uuid") or "")')
+
+                                [ -n "$PTASK" ] || { echo "ERROR: no task_uuid from power on" >&2; exit 1; }
+
+                                for i in $(seq 1 120); do
+                                    TT=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" "$PC/api/nutanix/v3/tasks/$PTASK")
+                                    SS=$(echo "$TT" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("status",""))')
+                                    [ "$SS" = "SUCCEEDED" ] && break
+                                    [ "$SS" = "FAILED" ] && { echo "ERROR: power on failed" >&2; exit 1; }
+                                    sleep 2
+                                done
+                            else
+                                echo "VM already ON - skipping power-on task" >&2
+                            fi
+
+                            for i in $(seq 1 240); do
+                                VM_GET=$(curl -sk -H "X-ntnx-api-key: $NTNX_SECRET" \
+                                    -H 'Content-Type: application/json' \
+                                    -X GET "$PC/api/nutanix/v3/vms/${UUID}")
+
+                                IP=$(echo "$VM_GET" | python3 -c '
+import sys,json,re
+d=json.load(sys.stdin)
+def valid(ip):
+    return isinstance(ip,str) and re.match(r"^\\d+\\.\\d+\\.\\d+\\.\\d+$",ip) and not ip.startswith(("127.","169.254.","172.17."))
+nics=(d.get("status",{}) or {}).get("resources",{}).get("nic_list",[]) or []
+candidates=[]
+for n in nics:
+    for ep in (n.get("ip_endpoint_list",[]) or []):
+        candidates.append(ep.get("ip",""))
+for n in nics:
+    candidates.append(n.get("ip_address",""))
+for ip in candidates:
+    if valid(ip):
+        print(ip); raise SystemExit(0)
+raise SystemExit(1)
+' 2>/dev/null || true
+
+                                [ -n "$IP" ] && { echo "$IP"; exit 0; }
+                                sleep 5
+                            done
+
+                            echo "ERROR: no IP from DHCP" >&2
+                            exit 1
+                        ''').trim()
+
+                        env.TARGET_VM_IP = ip
+                        echo "TARGET_VM_IP=${env.TARGET_VM_IP} (VM: ${env.VM_NAME})"
                     }
                 }
+            }
+        }
 
-                env.TARGET_VM_IP = vmIP
+        // ----------------------------------------------------------------
+        // NEW: Provision dev schema on shared PostgreSQL
+        // ----------------------------------------------------------------
+        stage('Provision Dev Schema') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'nmdb-db-admin',
+                        usernameVariable: 'DB_ADMIN_USER',
+                        passwordVariable: 'DB_ADMIN_PASS'
+                    ),
+                    usernamePassword(
+                        credentialsId: 'nmdb-db-app',
+                        usernameVariable: 'NMDB_APP_USER',
+                        passwordVariable: 'NMDB_APP_PASS'
+                    )
+                ]) {
+                    sh '''
+                        set -euo pipefail
+
+                        export DB_ADMIN_URL="postgresql://${DB_ADMIN_USER}:${DB_ADMIN_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+                        export DB_APP_USER="${NMDB_APP_USER}"
+
+                        # Idempotent — safe to re-run on existing branch
+                        python3 provision_schema.py "${DEV_SCHEMA}"
+
+                        echo "Dev schema ready: ${DEV_SCHEMA}"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // NEW: Run Alembic migrations on dev schema
+        // ----------------------------------------------------------------
+        stage('Migrate Dev Schema') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'nmdb-db-app',
+                        usernameVariable: 'NMDB_APP_USER',
+                        passwordVariable: 'NMDB_APP_PASS'
+                    )
+                ]) {
+                    sh '''
+                        set -euo pipefail
+
+                        export DATABASE_URL="postgresql://${NMDB_APP_USER}:${NMDB_APP_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}?options=-csearch_path=${DEV_SCHEMA}"
+
+                        alembic upgrade head
+
+                        echo "Migrations applied to ${DEV_SCHEMA}"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Generate Docker server TLS cert scoped to VM name + IP
+        // ----------------------------------------------------------------
+        stage('Generate Docker Server Cert (DNS+IP)') {
+            steps {
+                sh '''
+                    set -euo pipefail
+                    CA_DIR="${DOCKER_CA_DIR}"
+                    OUT_DIR="${CERT_OUT_DIR}"
+
+                    test -f "${CA_DIR}/ca.pem"
+                    test -f "${CA_DIR}/ca-key.pem"
+
+                    mkdir -p "$OUT_DIR"
+                    cd "$OUT_DIR"
+
+                    cat > server-ext.cnf <<EOT
+subjectAltName = DNS:${VM_FQDN},IP:${TARGET_VM_IP}
+extendedKeyUsage = serverAuth
+EOT
+
+                    openssl genrsa -out server-key.pem 4096
+                    openssl req -new -key server-key.pem -out server.csr \
+                        -subj "/CN=${VM_FQDN}"
+                    openssl x509 -req -days 825 -sha256 \
+                        -in server.csr \
+                        -CA "${CA_DIR}/ca.pem" \
+                        -CAkey "${CA_DIR}/ca-key.pem" \
+                        -CAcreateserial \
+                        -out server-cert.pem \
+                        -extfile server-ext.cnf
+
+                    echo "Server cert generated for VM_NAME=${VM_NAME} IP=${TARGET_VM_IP}"
+                '''
+            }
+        }
+
+        stage('Debug: Check TLS Dir') {
+            steps {
+                sh '''
+                    echo "Running on: $(hostname)"
+                    echo "Running as: $(whoami)"
+                    ls -la /opt/docker-tls/ || echo "/opt/docker-tls does not exist"
+                '''
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Provision Jenkins client certs (branch-scoped)
+        // ----------------------------------------------------------------
+        stage('Provision Jenkins Client Certs') {
+            steps {
+                sh '''
+                    set -euo pipefail
+                    CA_DIR="${DOCKER_CA_DIR}"
+                    CLIENT_DIR="${TLS_DIR}"
+
+                    mkdir -p "$CLIENT_DIR"
+
+                    if [ ! -f "${CLIENT_DIR}/cert.pem" ]; then
+                        echo "Generating new client cert for ${BRANCH_SLUG}" >&2
+                        openssl genrsa -out "${CLIENT_DIR}/key.pem" 4096
+                        openssl req -new -key "${CLIENT_DIR}/key.pem" \
+                            -out "${CLIENT_DIR}/client.csr" \
+                            -subj "/CN=jenkins-${BRANCH_SLUG}"
+                        echo "extendedKeyUsage = clientAuth" > "${CLIENT_DIR}/client-ext.cnf"
+                        openssl x509 -req -days 825 -sha256 \
+                            -in  "${CLIENT_DIR}/client.csr" \
+                            -CA  "${CA_DIR}/ca.pem" \
+                            -CAkey "${CA_DIR}/ca-key.pem" \
+                            -CAcreateserial \
+                            -out "${CLIENT_DIR}/cert.pem" \
+                            -extfile "${CLIENT_DIR}/client-ext.cnf"
+                    else
+                        echo "Reusing existing client cert at ${CLIENT_DIR}" >&2
+                    fi
+
+                    cp -f "${CA_DIR}/ca.pem" "${CLIENT_DIR}/ca.pem"
+                    chmod 600 "${CLIENT_DIR}/key.pem" \
+                              "${CLIENT_DIR}/cert.pem" \
+                              "${CLIENT_DIR}/ca.pem"
+
+                    echo "Client certs ready: ${CLIENT_DIR}"
+                '''
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Push TLS server certs to VM and restart dockerd
+        // ----------------------------------------------------------------
+        stage('Configure Docker TLS on VM') {
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'NMDB_DEPLOY_SSH',
+                    keyFileVariable: 'SSH_KEY',
+                    usernameVariable: 'SSH_USER'
+                )]) {
+                    sh '''
+                        set -euo pipefail
+                        OUT_DIR="${CERT_OUT_DIR}"
+                        TARGET="${SSH_USER}@${TARGET_VM_IP}"
+                        TLS_PORT="${DOCKER_TLS_PORT}"
+
+                        chmod 600 "$SSH_KEY" || true
+                        SSH_OPTS="-i $SSH_KEY -o IdentitiesOnly=yes \
+                            -o PreferredAuthentications=publickey \
+                            -o StrictHostKeyChecking=no \
+                            -o UserKnownHostsFile=/dev/null"
+
+                        ssh $SSH_OPTS "$TARGET" "sudo -n true"
+                        ssh $SSH_OPTS "$TARGET" \
+                            "sudo -n mkdir -p /etc/docker/ssl /etc/systemd/system/docker.service.d \
+                             && sudo -n chmod 700 /etc/docker/ssl"
+
+                        scp $SSH_OPTS "${OUT_DIR}/server-cert.pem" "$TARGET:/tmp/server-cert.pem"
+                        scp $SSH_OPTS "${OUT_DIR}/server-key.pem"  "$TARGET:/tmp/server-key.pem"
+                        scp $SSH_OPTS "${DOCKER_CA_DIR}/ca.pem"    "$TARGET:/tmp/ca.pem"
+
+                        ssh $SSH_OPTS "$TARGET" "set -euo pipefail
+                            ls -l /tmp/ca.pem /tmp/server-cert.pem /tmp/server-key.pem
+                            sudo -n mv -f /tmp/ca.pem          /etc/docker/ssl/ca.pem
+                            sudo -n mv -f /tmp/server-cert.pem /etc/docker/ssl/server-cert.pem
+                            sudo -n mv -f /tmp/server-key.pem  /etc/docker/ssl/server-key.pem
+                            sudo -n chmod 600 /etc/docker/ssl/ca.pem \
+                                              /etc/docker/ssl/server-cert.pem \
+                                              /etc/docker/ssl/server-key.pem
+                            sudo -n tee /etc/systemd/system/docker.service.d/override.conf >/dev/null <<EOT
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:${TLS_PORT} --tlsverify --tlscacert=/etc/docker/ssl/ca.pem --tlscert=/etc/docker/ssl/server-cert.pem --tlskey=/etc/docker/ssl/server-key.pem
+EOT
+                            sudo -n systemctl daemon-reload
+                            sudo -n systemctl restart docker
+                            sudo -n systemctl is-active --quiet docker
+                            sudo -n ss -lntp | grep -E ':${TLS_PORT}\\b' || true"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Deploy container from Harbor with DATABASE_URL injected
+        // ----------------------------------------------------------------
+        stage('Deploy from Harbor via Docker TLS') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: "${HARBOR_CRED_ID}",
+                        usernameVariable: 'HUSER',
+                        passwordVariable: 'HPASS'
+                    ),
+                    usernamePassword(
+                        credentialsId: 'nmdb-db-app',
+                        usernameVariable: 'NMDB_APP_USER',
+                        passwordVariable: 'NMDB_APP_PASS'
+                    )
+                ]) {
+                    sh '''
+                        set -euo pipefail
+
+                        export DOCKER_HOST="tcp://${TARGET_VM_IP}:${DOCKER_TLS_PORT}"
+                        export DOCKER_TLS_VERIFY=1
+                        export DOCKER_CERT_PATH="${TLS_DIR}"
+
+                        FULL_IMAGE="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+                        # Construct the DATABASE_URL for this branch's schema
+                        DB_URL="postgresql://${NMDB_APP_USER}:${NMDB_APP_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}?options=-csearch_path=${DEV_SCHEMA}"
+
+                        echo "Deploying ${FULL_IMAGE} → ${TARGET_VM_IP} (${VM_NAME})"
+                        echo "Schema: ${DEV_SCHEMA}"
+
+                        echo "$HPASS" | docker login "${HARBOR_REGISTRY}" -u "$HUSER" --password-stdin
+                        docker pull "$FULL_IMAGE"
+
+                        # Remove named container if exists
+                        docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+
+                        # Remove any container holding HOST_PORT
+                        CONFLICT=$(docker ps -q --filter "publish=${HOST_PORT}")
+                        if [ -n "$CONFLICT" ]; then
+                            echo "WARNING: removing conflicting container(s) on port ${HOST_PORT}: $CONFLICT"
+                            docker rm -f $CONFLICT || true
+                        fi
+
+                        docker run -d \
+                            --restart unless-stopped \
+                            --name "${CONTAINER_NAME}" \
+                            -p "${HOST_PORT}:${CONTAINER_PORT}" \
+                            -e "DATABASE_URL=${DB_URL}" \
+                            -e "ENVIRONMENT=dev" \
+                            "$FULL_IMAGE"
+
+                        docker logout "${HARBOR_REGISTRY}"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Smoke test
+        // ----------------------------------------------------------------
+        stage('Smoke test') {
+            steps {
+                sh '''
+                    set -euo pipefail
+                    curl -sS --max-time 8 "http://${TARGET_VM_IP}:${HOST_PORT}/" || true
+                '''
             }
         }
     }
