@@ -1,19 +1,17 @@
 """
-tests/test_reference.py
-Tests for Reference Data endpoints — Missions only.
+tests/ew_track/test_mission.py
+Tests for Mission reference endpoints.
 
 Endpoints under test:
-  POST  /missions       GET /missions      GET /missions/{id}   PATCH /missions/{id}
+  POST  /missions
+  GET   /missions
+  GET   /missions/{id}
+  PATCH /missions/{id}
 """
-import pytest
 
 CLS = "SECRET"
 MISSING_UUID = "00000000-0000-0000-0000-000000000000"
 
-
-# ===========================================================================
-# Missions  —  id: UUID
-# ===========================================================================
 
 class TestMissionCreate:
 
@@ -25,13 +23,12 @@ class TestMissionCreate:
         assert data["id"] is not None
 
     def test_create_with_time_window(self, client):
-        payload = {
+        resp = client.post("/missions", json={
             "name": "Op Bravo",
             "classification": CLS,
             "start_at": "2024-06-01T08:00:00Z",
             "end_at":   "2024-06-01T12:00:00Z",
-        }
-        resp = client.post("/missions", json=payload)
+        })
         assert resp.status_code == 201
         data = resp.json()
         assert "2024-06-01" in data["start_at"]
@@ -47,12 +44,10 @@ class TestMissionCreate:
         assert resp.status_code == 422
 
     def test_create_missing_name_returns_422(self, client):
-        resp = client.post("/missions", json={"classification": CLS})
-        assert resp.status_code == 422
+        assert client.post("/missions", json={"classification": CLS}).status_code == 422
 
     def test_create_missing_classification_returns_422(self, client):
-        resp = client.post("/missions", json={"name": "Op"})
-        assert resp.status_code == 422
+        assert client.post("/missions", json={"name": "Op"}).status_code == 422
 
 
 class TestMissionRead:
@@ -96,7 +91,7 @@ class TestMissionUpdate:
         })
         assert resp.status_code == 200
 
-    def test_patch_end_before_start_in_payload_returns_422(self, client, mission):
+    def test_patch_end_before_start_returns_422(self, client, mission):
         resp = client.patch(f"/missions/{mission['id']}", json={
             "start_at": "2024-07-01T20:00:00Z",
             "end_at":   "2024-07-01T08:00:00Z",
@@ -104,6 +99,4 @@ class TestMissionUpdate:
         assert resp.status_code == 422
 
     def test_patch_not_found_returns_404(self, client):
-        resp = client.patch(f"/missions/{MISSING_UUID}", json={"name": "X"})
-        assert resp.status_code == 404
-
+        assert client.patch(f"/missions/{MISSING_UUID}", json={"name": "X"}).status_code == 404
