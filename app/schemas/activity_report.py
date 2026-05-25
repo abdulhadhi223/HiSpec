@@ -1,11 +1,9 @@
-"""
-app/schemas/activity_report.py
-Pydantic request/response schemas for Activity Report endpoints.
-"""
-import uuid
+"""Pydantic schemas for Activity Report endpoints."""
 import datetime
-from typing import Optional
-from pydantic import BaseModel, Field, field_validator
+import uuid
+from typing import Self
+
+from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator, model_validator
 
 from app.core.enum import (
     Classification,
@@ -14,111 +12,160 @@ from app.core.enum import (
     SignalType,
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared mixin
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# ActivityReport
-# ---------------------------------------------------------------------------
-class ActivityReportBase(BaseModel):
-    name:           Optional[str] = None
-    submitted_by:   str
-    start_at:       Optional[datetime.datetime] = None
-    end_at:         Optional[datetime.datetime] = None
-    classification: Classification
+
+class _TimeWindowMixin(BaseModel):
+    start_at: datetime.datetime | None = None
+    end_at: datetime.datetime | None = None
 
     @field_validator("end_at")
     @classmethod
-    def end_after_start(cls, v, info):
-        start = info.data.get("start_at")
-        if v and start and v < start:
-            raise ValueError("end_at must be >= start_at")
-        return v
+    def validate_time_window(
+        cls,
+        end_at: datetime.datetime | None,
+        info: ValidationInfo,
+    ) -> datetime.datetime | None:
+        start_at = info.data.get("start_at")
+        if start_at and end_at and end_at < start_at:
+            raise ValueError("end_at must be greater than or equal to start_at")
+        return end_at
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ActivityReport
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ActivityReportBase(_TimeWindowMixin):
+    name: str | None = None  # optional user-provided title
+    submitted_by: str
+    classification: Classification
+
 
 class ActivityReportCreate(ActivityReportBase):
-    mission_ids: list[uuid.UUID] = []   # link missions at creation time
+    mission_ids: list[uuid.UUID] = []
 
-class ActivityReportUpdate(BaseModel):
-    name:           Optional[str]               = None
-    start_at:       Optional[datetime.datetime] = None
-    end_at:         Optional[datetime.datetime] = None
-    classification: Optional[Classification] = None
+
+class ActivityReportUpdate(_TimeWindowMixin):
+    name: str | None = None
+    classification: Classification | None = None
+
 
 class ActivityReportResponse(ActivityReportBase):
-    id:         uuid.UUID
+    id: uuid.UUID
     created_at: datetime.datetime
     updated_at: datetime.datetime
-    model_config = {"from_attributes": True}
 
-class ActivityReportDetailResponse(ActivityReportResponse):
-    """Full report with nested instances and linked missions."""
-    instances:       list["ActivityReportInstanceResponse"] = []
-    report_missions: list["ActivityReportMissionResponse"]  = []
+    model_config = ConfigDict(from_attributes=True)
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # ActivityReportInstance
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class ActivityReportInstanceBase(BaseModel):
-    # Emitter identity (snapshot)
-    emitter_id:           Optional[int]   = None
-    emitter_name:         Optional[str]   = None
-    emitter_confidence:   Optional[float] = Field(None, ge=0, le=1)
-    emitter_country_code: Optional[str]   = Field(None, max_length=3)
-    emitter_country_name: Optional[str]   = None
+    activity_report_id: uuid.UUID
+    track_id: uuid.UUID | None = None
 
-    # Tactical
-    signal_type: SignalType
-    hostility:   HostilityType
+    signal_type: SignalType | None = None
+    hostility: HostilityType | None = None
 
-    # Time window
-    first_seen_dtg: datetime.datetime
-    last_seen_dtg:  datetime.datetime
+    first_seen_dtg: datetime.datetime | None = None
+    last_seen_dtg: datetime.datetime | None = None
 
-    # Last known position
-    last_position_longitude_dd: float = Field(..., ge=-180, le=180)
-    last_position_latitude_dd:  float = Field(..., ge=-90,  le=90)
-    last_position_error_m:      Optional[int] = Field(None, ge=0)
+    last_position_longitude_dd: float | None = None
+    last_position_latitude_dd: float | None = None
+    # Schema v5: integer >= 0, no upper bound
+    last_position_error_m: int | None = None
 
-    # Platform (snapshot)
-    platform_category: Optional[PlatformCategoryType] = None
-    platform_name:     Optional[str] = None
-    platform_id:       Optional[str] = None
-    platform_class:    Optional[str] = None
+    platform_category: PlatformCategoryType | None = None
+    platform_name: str | None = None
+    platform_id: str | None = None
+    platform_class: str | None = None
 
-    # Metadata
-    classification: Classification
-    source_system:  str
+    emitter_id: str | None = None  # matches ORM EWTrackEmitter.emitter_id_sensor String(64)
+    emitter_name: str | None = None
+    # Schema v5: double [0..1] inclusive
+    emitter_confidence: float | None = None
+    emitter_country_code: str | None = None
+    emitter_country_name: str | None = None
 
-    @field_validator("last_seen_dtg")
+    classification: Classification | None = None
+    source_system: str | None = None
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> Self:
+        if self.first_seen_dtg and self.last_seen_dtg:
+            if self.first_seen_dtg > self.last_seen_dtg:
+                raise ValueError("last_seen_dtg must be >= first_seen_dtg")
+        return self
+
+    @field_validator("last_position_latitude_dd")
     @classmethod
-    def last_after_first(cls, v, info):
-        first = info.data.get("first_seen_dtg")
-        if first and v < first:
-            raise ValueError("last_seen_dtg must be >= first_seen_dtg")
+    def validate_lat(cls, v: float | None) -> float | None:
+        if v is not None and not (-90 <= v <= 90):
+            raise ValueError("Latitude must be between -90 and 90")
         return v
 
+    @field_validator("last_position_longitude_dd")
+    @classmethod
+    def validate_lon(cls, v: float | None) -> float | None:
+        if v is not None and not (-180 <= v <= 180):
+            raise ValueError("Longitude must be between -180 and 180")
+        return v
+
+    @field_validator("last_position_error_m")
+    @classmethod
+    def validate_error_m(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("last_position_error_m must be >= 0")
+        return v
+
+    @field_validator("emitter_confidence")
+    @classmethod
+    def validate_emitter_confidence(cls, v: float | None) -> float | None:
+        if v is not None and not (0.0 <= v <= 1.0):
+            raise ValueError("emitter_confidence must be between 0.0 and 1.0")
+        return v
+
+
 class ActivityReportInstanceCreate(ActivityReportInstanceBase):
-    activity_report_id: uuid.UUID
-    track_id:           Optional[uuid.UUID] = None   # optional link to live EWTrack
+    """Schema for creating an ActivityReportInstance."""
+
 
 class ActivityReportInstanceResponse(ActivityReportInstanceBase):
-    id:                 uuid.UUID
-    activity_report_id: uuid.UUID
-    track_id:           Optional[uuid.UUID] = None
-    created_at:         datetime.datetime
-    updated_at:         datetime.datetime
-    model_config = {"from_attributes": True}
+    id: uuid.UUID
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
-# ---------------------------------------------------------------------------
-# ActivityReportMission  (lightweight — used inside detail responses)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# ActivityReportMission
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class ActivityReportMissionResponse(BaseModel):
-    id:                 uuid.UUID
+    id: uuid.UUID
     activity_report_id: uuid.UUID
-    mission_id:         uuid.UUID
-    created_at:         datetime.datetime
-    model_config = {"from_attributes": True}
+    mission_id: uuid.UUID
+    created_at: datetime.datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
-# ── Forward-reference resolution ─────────────────────────────────────────────
-ActivityReportDetailResponse.model_rebuild()
+# ─────────────────────────────────────────────────────────────────────────────
+# ActivityReport Detail
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ActivityReportDetailResponse(ActivityReportResponse):
+    instances: list["ActivityReportInstanceResponse"] = []
+    report_missions: list["ActivityReportMissionResponse"] = []
+
+    model_config = ConfigDict(from_attributes=True)

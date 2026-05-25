@@ -295,8 +295,8 @@ class ActivityReportInstance(Base):
     activity_report_id: Mapped[uuid.UUID]        = mapped_column(UUID(as_uuid=True), ForeignKey("activity_report.id"), nullable=False)
     track_id:           Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("ew_track.id"),        nullable=True)
 
-    # Emitter identity (snapshot at report time)
-    emitter_id:           Mapped[int | None]   = mapped_column(Integer,     nullable=True)
+    # Emitter identity (snapshot at report time — str matches EWTrackEmitter.emitter_id_sensor)
+    emitter_id:           Mapped[str | None]   = mapped_column(String(64),  nullable=True)
     emitter_name:         Mapped[str | None]   = mapped_column(String(255), nullable=True)
     emitter_confidence:   Mapped[float | None] = mapped_column(Double,      nullable=True)
     emitter_country_code: Mapped[str | None]   = mapped_column(String(3),   nullable=True)
@@ -306,13 +306,13 @@ class ActivityReportInstance(Base):
     signal_type: Mapped[SignalType]    = mapped_column(_sig, nullable=False)
     hostility:   Mapped[HostilityType] = mapped_column(_hos, nullable=False)
 
-    # Time window
-    first_seen_dtg: Mapped[datetime.datetime] = mapped_column(TZ, nullable=False)
-    last_seen_dtg:  Mapped[datetime.datetime] = mapped_column(TZ, nullable=False)
+    # Time window (nullable: auto mode with no track points leaves these unset)
+    first_seen_dtg: Mapped[datetime.datetime | None] = mapped_column(TZ, nullable=True)
+    last_seen_dtg:  Mapped[datetime.datetime | None] = mapped_column(TZ, nullable=True)
 
-    # Last known position
-    last_position_longitude_dd: Mapped[float]      = mapped_column(Double,  nullable=False)
-    last_position_latitude_dd:  Mapped[float]      = mapped_column(Double,  nullable=False)
+    # Last known position (nullable for same reason as above)
+    last_position_longitude_dd: Mapped[float | None] = mapped_column(Double, nullable=True)
+    last_position_latitude_dd:  Mapped[float | None] = mapped_column(Double, nullable=True)
     last_position_error_m:      Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Platform (snapshot — string fields, no live FK)
