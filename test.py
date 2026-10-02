@@ -1,127 +1,225 @@
-PostgreSQL and pgAdmin – Staging Setup
-Overview
-The NMDB staging environment uses PostgreSQL and pgAdmin deployed on a Rocky Linux VM using Docker Compose.
-Current staging database configuration:
-PostgreSQL Host : 10.192.24.81
-PostgreSQL Port : 8080
-Database        : nmdb_staging
+REPORT_CSS = """
+body {
+    font-family: Arial, sans-serif;
+    margin: 30px;
+    background: #f7f7f7;
+}
 
-pgAdmin         : http://10.192.24.81/
+.report {
+    background: white;
+    padding: 24px;
+    border: 1px solid #ddd;
+    max-width: 1200px;
+}
 
-PostgreSQL runs inside the container on port 5432 and is exposed through host port 8080.
-pgAdmin connects to PostgreSQL internally using:
-Host : db
-Port : 5432
+h2 {
+    margin-top: 0;
+}
 
-The current PostgreSQL image is:
-postgres:18.6-bookworm
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
 
-Persistent PostgreSQL data is stored under:
-/opt/postgres-staging/data
+th {
+    background: #eeeeee;
+    font-weight: bold;
+}
 
-The staging database is used by release/stage/staging branches through Jenkins environment configuration.
-Prerequisites
-The staging VM requires:
-Rocky Linux
-Docker
-Docker Compose
-Access to the internal container registry
-Required firewall ports opened
+th, td {
+    border: 1px solid #cccccc;
+    padding: 9px 12px;
+    text-align: left;
+    vertical-align: top;
+}
 
-Required ports:
-8080/tcp  - PostgreSQL
-80/tcp    - pgAdmin
+tr:nth-child(even) {
+    background: #fafafa;
+}
+"""
 
-Create the PostgreSQL persistent directory:
-sudo mkdir -p /opt/postgres-staging/data
-sudo chown -R 999:999 /opt/postgres-staging/data
 
-Docker Compose Configuration
-The staging Compose file contains PostgreSQL and pgAdmin services.
-Example structure:
-services:
-  db:
-    image: postgres:18.6-bookworm
-    container_name: nmdb-postgres-staging
-    restart: unless-stopped
+def write_report_css(path: str = "report.css") -> None:
+    Path(path).write_text(REPORT_CSS, encoding="utf-8")
 
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: nmdb_staging
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>NMDB Release Metadata</title>
+<link rel="stylesheet" href="report.css">
+</head>
 
-    ports:
-      - "8080:5432"
+<body>
+<div class="report">
 
-    volumes:
-      - /opt/postgres-staging/data:/var/lib/postgresql:Z
+<h2>NMDB Release Metadata</h2>
 
-  pgadmin:
-    image: <pgadmin-image>
-    container_name: nmdb-pgadmin-staging
-    restart: unless-stopped
+<table>
+<tr>
+    <th>Field</th>
+    <th>Value</th>
+</tr>
 
-    environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+<tr><td>Branch</td><td>{branch}</td></tr>
+<tr><td>Build Number</td><td>{build_number}</td></tr>
+<tr><td>Git Commit</td><td>{git_commit}</td></tr>
+<tr><td>Docker Image</td><td>{docker_image}</td></tr>
+<tr><td>VM Name</td><td>{vm_name}</td></tr>
+<tr><td>VM IP</td><td>{vm_ip}</td></tr>
+<tr>
+    <td>FastAPI Swagger</td>
+    <td>
+        <a href="http://{vm_ip}:8080/docs">
+            http://{vm_ip}:8080/docs
+        </a>
+    </td>
+</tr>
+<tr><td>Database Host</td><td>{db_host}</td></tr>
+<tr><td>DB Name</td><td>{db_name}</td></tr>
+<tr><td>DB Port</td><td>{db_port}</td></tr>
+<tr><td>Schema</td><td>{schema}</td></tr>
 
-    ports:
-      - "80:80"
+</table>
 
-    depends_on:
-      - db
+</div>
+</body>
+</html>
+"""
 
-Credentials should be maintained through an .env file or another approved secret/configuration mechanism and should not be committed into source control.
-pgAdmin Connection
-After pgAdmin is started, register the staging PostgreSQL server using:
-Name        : NMDB Staging
-Host        : db
-Port        : 5432
-Database    : nmdb_staging
-Username    : <postgres user>
-Password    : <postgres password>
-SSL Mode    : Disable
+write_report_css()
+Path(output_file).write_text(html, encoding="utf-8")
 
-Important:
-External connection:
-10.192.24.81:8080
 
-pgAdmin internal connection:
-db:5432
 
-Jenkins Integration
-The staging database values are maintained through Jenkins environment variables:
-STAGE_DB_HOST=10.192.24.81
-STAGE_DB_PORT=8080
-STAGE_DB_NAME=nmdb_staging
-STAGE_SCHEMA_PREFIX=stage_
+def write_prospector_html(
+    input_file: str,
+    output_file: str,
+) -> None:
+    import html
+    import json
 
-Branches matching:
-release/*
-stage/*
-staging/*
+    data = json.loads(
+        Path(input_file).read_text(encoding="utf-8")
+    )
 
-use the staging PostgreSQL instance.
-Branch-specific schemas are created in the format:
-stage_<branch_name>
-stage_<branch_name>_nec
+    messages = data.get("messages", [])
 
-Database passwords remain stored in Jenkins Credentials.
-Important Commands
-Start or update the services:
-docker compose up -d
+    rows = []
 
-Check status:
-docker compose ps
+    for item in messages:
+        location = item.get("location", {})
 
-View PostgreSQL logs:
-docker compose logs db
+        path = (
+            location.get("path")
+            or item.get("path")
+            or ""
+        )
 
-View pgAdmin logs:
-docker compose logs pgadmin
+        line = (
+            location.get("line")
+            or item.get("line")
+            or ""
+        )
 
-Restart services:
-docker compose restart
+        code = item.get("code", "")
+        message = item.get("message", "")
 
-Stop services:
-docker compose down
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(path))}</td>"
+            f"<td>{html.escape(str(line))}</td>"
+            f"<td>{html.escape(str(code))}</td>"
+            f"<td>{html.escape(str(message))}</td>"
+            "</tr>"
+        )
+
+    if not rows:
+        rows.append(
+            '<tr><td colspan="4">'
+            'No Prospector issues found'
+            '</td></tr>'
+        )
+
+    document = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>NMDB Prospector Report</title>
+<link rel="stylesheet" href="report.css">
+</head>
+
+<body>
+<div class="report">
+
+<h2>NMDB Prospector Report</h2>
+
+<table>
+<tr>
+    <th>File</th>
+    <th>Line</th>
+    <th>Code</th>
+    <th>Message</th>
+</tr>
+
+{''.join(rows)}
+
+</table>
+
+</div>
+</body>
+</html>
+"""
+
+    write_report_css()
+
+    Path(output_file).write_text(
+        document,
+        encoding="utf-8",
+    )
+
+    print(f"PROSPECTOR_HTML={output_file}")
+
+    phtml = sub.add_parser("prospector-html")
+phtml.add_argument("--input", required=True)
+phtml.add_argument("--output", required=True)
+
+
+elif a.cmd == "prospector-html":
+    write_prospector_html(
+        input_file=a.input,
+        output_file=a.output,
+    )
+
+
+stage('Prospector Report') {
+    when {
+        expression {
+            return env.IS_STAGING == 'true'
+        }
+    }
+
+    steps {
+        sh '''#!/usr/bin/env bash
+            set +e
+
+            prospector \
+                --output-format json \
+                > prospector.json
+
+            PROSPECTOR_RC=$?
+
+            python3 "$RELEASE_PY" prospector-html \
+                --input prospector.json \
+                --output prospector.html
+
+            exit 0
+        '''
+
+        archiveArtifacts(
+            artifacts: 'prospector.json,prospector.html,report.css',
+            fingerprint: true,
+            allowEmptyArchive: false
+        )
+    }
+}
