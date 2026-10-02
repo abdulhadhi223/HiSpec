@@ -1,46 +1,27 @@
-def write_prospector_html(
-    input_file: str,
-    output_file: str,
-) -> None:
+stage('Prospector Report') {
+    steps {
+        sh '''#!/usr/bin/env bash
+            set +e
 
-    data = json.loads(
-        Path(input_file).read_text(encoding="utf-8")
-    )
+            prospector \
+                --output-format json \
+                > prospector.json
 
-    messages = data.get("messages", [])
+            PROSPECTOR_RC=$?
 
-    rows = []
+            python3 "$RELEASE_PY" prospector-html \
+                --input prospector.json \
+                --output prospector.html
 
-    for item in messages:
-        location = item.get("location", {})
+            echo "Prospector exit code: $PROSPECTOR_RC"
 
-        path = (
-            location.get("path")
-            or item.get("path")
-            or ""
+            exit 0
+        '''
+
+        archiveArtifacts(
+            artifacts: 'prospector.json,prospector.html,report.css',
+            fingerprint: true,
+            allowEmptyArchive: false
         )
-
-        line = (
-            location.get("line")
-            or item.get("line")
-            or ""
-        )
-
-        rows.append([
-            path,
-            line,
-            item.get("code", ""),
-            item.get("message", ""),
-        ])
-
-    render_html_report(
-        title="NMDB Prospector Report",
-        headers=[
-            "File",
-            "Line",
-            "Code",
-            "Message",
-        ],
-        rows=rows,
-        output_file=output_file,
-    )
+    }
+}
