@@ -1,5 +1,5 @@
 
-stage('Deploy NEC to static VM') {
+stage('Migrate NEC Database') {
     when {
         expression {
             return params.IMAGE_TAG?.trim() &&
@@ -10,65 +10,65 @@ stage('Deploy NEC to static VM') {
     steps {
         withCredentials([
             usernamePassword(
-                credentialsId: 'Harbor',
-                usernameVariable: 'HUSER',
-                passwordVariable: 'HPASS'
-            ),
-            usernamePassword(
                 credentialsId: 'nec-db-app',
                 usernameVariable: 'NEC_APP_USER',
                 passwordVariable: 'NEC_APP_PASS'
             )
         ]) {
-            withEnv([
-                "APP_HEALTH_PATH=${params.APP_HEALTH_PATH ?: '/health'}"
-            ]) {
-                sh '''#!/usr/bin/env bash
+            sh '''#!/usr/bin/env bash
 set +x
 set -euo pipefail
 
-# Validate configuration
-: "${NEC_STATIC_VM_NAME:?Missing NEC VM name}"
-: "${NEC_STATIC_VM_IP:?Missing NEC VM IP}"
-: "${NEC_DB_HOST:?Missing NEC DB host}"
-: "${NEC_DB_PORT:?Missing NEC DB port}"
-: "${NEC_DB_NAME:?Missing NEC DB name}"
-: "${FULL_IMAGE:?Missing NEC image}"
-: "${NEC_APP_USER:?Missing NEC DB user}"
-: "${NEC_APP_PASS:?Missing NEC DB password}"
+: "${NEC_DB_HOST:?}"
+: "${NEC_DB_PORT:?}"
+: "${NEC_DB_NAME:?}"
 
-# Build database URL with encoded credentials.
-export DATABASE_URL="$(
-python3 - <<'PY'
+# Ensure NEC database migration files exist.
+test -f alembic.nec.ini
+test -f alembic_nec/env.py
+test -d alembic_nec/versions
+
+# Reuse the Jenkins offline Python environment.
+if [[ ! -x .venv/bin/python ]]; then
+    python3 -m venv .venv
+    . .venv/bin/activate
+    pip install --quiet --no-index --find-links=wheels \
+        -r requirements.txt
+    pip install --quiet --no-index --find-links=wheels \
+        psycopg2-binary
+else
+    . .venv/bin/activate
+fi
+
+# The NEC env.py must read this variable.
+export NEC_MIGRATION_DATABASE_URL="$(
+python - <<'PY'
 import os
-from urllib.parse import quote
+from sqlalchemy.engine import URL
 
-user = quote(os.environ["NEC_APP_USER"], safe="")
-password = quote(os.environ["NEC_APP_PASS"], safe="")
-host = os.environ["NEC_DB_HOST"]
-port = int(os.environ["NEC_DB_PORT"])
-database = quote(os.environ["NEC_DB_NAME"], safe="")
-
-print(
-    f"postgresql+asyncpg://{user}:{password}"
-    f"@{host}:{port}/{database}"
+url = URL.create(
+    "postgresql+psycopg2",
+    username=os.environ["NEC_APP_USER"],
+    password=os.environ["NEC_APP_PASS"],
+    host=os.environ["NEC_DB_HOST"],
+    port=int(os.environ["NEC_DB_PORT"]),
+    database=os.environ["NEC_DB_NAME"]
 )
+
+print(url.render_as_string(hide_password=False))
 PY
 )"
 
-# Permanent NEC database schema
-export NEC_SCHEMA="public"
-export APP_MODE="nec"
-export APP_ENVIRONMENT="nec"
+# Keep environment-variable names consistent
+# with the NEC Alembic env.py.
+export DATABASE_URL="$NEC_MIGRATION_DATABASE_URL"
 
-# Reuse existing release manager.
-python3 "$RELEASE_PY" deploy \
-    --name "$NEC_STATIC_VM_NAME" \
-    --ip "$NEC_STATIC_VM_IP"
+echo "Running NEC migrations on ${NEC_DB_NAME}.public"
 
-echo "NEC deployment completed"
+alembic -c alembic.nec.ini upgrade head
+
+echo "NEC Alembic migration completed"
 '''
-            }
         }
     }
 }
