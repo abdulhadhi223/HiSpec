@@ -1,191 +1,296 @@
 
+from importlib import import_module
 from pathlib import Path
-from typing import Literal
+from types import ModuleType
 
-from fastapi import HTTPException
-from sqlalchemy import select, text
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
+import pytest
 
-from app.models.nrd.nrd_export_state import NrdExportState
-from app.services.nrd.export_file_service import (
-    get_export_path,
-    publish_export_candidate,
-    write_export_candidate,
+
+XML_V1 = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<Root><Name><![CDATA[Caf\u00e9 & Test]]></Name></Root>'
 )
-from app.services.nrd.export_service import ExportService
+
+XML_V2 = (
+    "<Root><Name><![CDATA[Updated]]></Name></Root>"
+)
 
 
-ExportType = Literal["technical", "tactical"]
+@pytest.fixture
+def export_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> ModuleType:
+    """Use the real file service with an isolated export directory."""
 
-EXPORT_LOCK_KEYS = {
-    "technical": 704001,
-    "tactical": 704002,
-}
+    # Import during fixture execution because your test setup
+    # reloads application modules.
+    service = import_module(
+        "app.services.nrd.export_file_service"
+    )
 
-MAX_EXPORT_ATTEMPTS = 3
+    monkeypatch.setattr(
+        service,
+        "EXPORT_DIR",
+        tmp_path / "exports" / "nrd",
+    )
 
-
-def get_exported_revision(
-    state: NrdExportState,
-    export_type: ExportType,
-) -> int:
-    if export_type == "technical":
-        return state.technical_exported_revision
-    return state.tactical_exported_revision
+    return service
 
 
-def set_exported_revision(
-    state: NrdExportState,
-    export_type: ExportType,
-    revision: int,
+@pytest.mark.parametrize(
+    ("export_type", "filename"),
+    [
+        ("technical", "nrd_technical.xml"),
+        ("Technical", "nrd_technical.xml"),
+        ("tactical", "nrd_tactical.xml"),
+    ],
+)
+def test_get_export_path(
+    export_files: ModuleType,
+    export_type: str,
+    filename: str,
 ) -> None:
-    if export_type == "technical":
-        state.technical_exported_revision = revision
-    else:
-        state.tactical_exported_revision = revision
+    """Resolve the correct filename, including case normalization."""
+
+    result = export_files.get_export_path(export_type)
+
+    assert result == export_files.EXPORT_DIR / filename
 
 
-def is_export_current(
-    db: Session,
-    export_type: ExportType,
-) -> bool:
-    state = db.get(NrdExportState, 1)
-    file_path = get_export_path(export_type)
+@pytest.mark.parametrize("export_type", ["invalid", ""])
+def test_invalid_export_type(
+    export_files: ModuleType,
+    export_type: str,
+) -> None:
+    """Reject invalid types without creating an export directory."""
 
-    if state is None or not file_path.is_file():
-        return False
+    with pytest.raises(ValueError, match="Invalid export type"):
+        export_files.get_export_path(export_type)
 
-    return (
-        state.data_revision
-        == get_exported_revision(state, export_type)
+    with pytest.raises(ValueError, match="Invalid export type"):
+        export_files.save_export_xml(
+            export_type=export_type,
+            xml_content=XML_V1,
+        )
+
+    assert not export_files.EXPORT_DIR.exists()
+
+
+@pytest.mark.parametrize("export_type", ["technical", "tactical"])
+def test_save_export_xml_creates_and_overwrites(
+    export_files: ModuleType,
+    export_type: str,
+) -> None:
+    """Create directories, save XML, and replace the same file."""
+
+    assert not export_files.EXPORT_DIR.exists()
+
+    first = export_files.save_export_xml(
+        export_type=export_type,
+        xml_content=XML_V1,
     )
 
+    assert isinstance(first, Path)
+    assert first.name == f"nrd_{export_type}.xml"
+    assert first.read_bytes() == XML_V1.encode("utf-8")
 
-def generate_snapshot_xml(
-    engine: Engine,
-    export_type: ExportType,
-) -> tuple[int, str]:
-    """Read revision and XML data from one PostgreSQL snapshot."""
-
-    snapshot_engine = engine.execution_options(
-        isolation_level="REPEATABLE READ"
+    second = export_files.save_export_xml(
+        export_type=export_type,
+        xml_content=XML_V2,
     )
 
-    with Session(snapshot_engine) as snapshot_db:
-        with snapshot_db.begin():
-            state = snapshot_db.get(NrdExportState, 1)
+    assert second == first
+    assert second.read_bytes() == XML_V2.encode("utf-8")
 
-            if state is None:
-                raise RuntimeError("NRD export state is missing")
-
-            revision = state.data_revision
-
-            xml_data = ExportService().export_all(
-                snapshot_db,
-                export_type,
-            )
-
-            return revision, xml_data
+    # Only the final XML remains; no temporary files.
+    assert list(first.parent.iterdir()) == [first]
 
 
-def publish_if_current(
-    engine: Engine,
-    export_type: ExportType,
-    revision: int,
-    candidate_path: Path,
-) -> bool:
-    """Check the latest revision while locking the state row."""
+def test_save_keeps_technical_and_tactical_separate(
+    export_files: ModuleType,
+) -> None:
+    """Saving one export type must not overwrite the other."""
 
-    with Session(engine) as db:
-        with db.begin():
-            state = db.execute(
-                select(NrdExportState)
-                .where(NrdExportState.id == 1)
-                .with_for_update()
-            ).scalar_one()
-
-            if state.data_revision != revision:
-                return False
-
-            # Invalidate metadata before filesystem replacement.
-            set_exported_revision(
-                state,
-                export_type,
-                -1,
-            )
-            db.flush()
-
-            publish_export_candidate(
-                candidate_path,
-                export_type,
-            )
-
-            set_exported_revision(
-                state,
-                export_type,
-                revision,
-            )
-
-            return True
-
-
-def ensure_current_export(
-    engine: Engine,
-    export_type: ExportType,
-) -> Path:
-    """Reuse XML when current, otherwise regenerate safely."""
-
-    file_path = get_export_path(export_type)
-
-    with Session(engine) as db:
-        if is_export_current(db, export_type):
-            return file_path
-
-    # Dedicated transaction-level lock prevents two exporters
-    # for the same type from regenerating simultaneously.
-    with engine.connect() as lock_conn:
-        with lock_conn.begin():
-            lock_conn.execute(
-                text(
-                    "SELECT pg_advisory_xact_lock(:lock_key)"
-                ),
-                {"lock_key": EXPORT_LOCK_KEYS[export_type]},
-            )
-
-            # Recheck after obtaining the lock.
-            with Session(engine) as db:
-                if is_export_current(db, export_type):
-                    return file_path
-
-            for _ in range(MAX_EXPORT_ATTEMPTS):
-                revision, xml_data = generate_snapshot_xml(
-                    engine,
-                    export_type,
-                )
-
-                candidate_path = write_export_candidate(
-                    export_type,
-                    xml_data,
-                )
-
-                try:
-                    if publish_if_current(
-                        engine,
-                        export_type,
-                        revision,
-                        candidate_path,
-                    ):
-                        return file_path
-                finally:
-                    candidate_path.unlink(
-                        missing_ok=True
-                    )
-
-    raise HTTPException(
-        status_code=409,
-        detail=(
-            "NRD data changed during export. "
-            "Please retry the export."
-        ),
+    technical = export_files.save_export_xml(
+        "technical",
+        XML_V1,
     )
+    tactical = export_files.save_export_xml(
+        "tactical",
+        XML_V2,
+    )
+
+    assert technical != tactical
+    assert technical.read_bytes() == XML_V1.encode("utf-8")
+    assert tactical.read_bytes() == XML_V2.encode("utf-8")
+
+    assert set(technical.parent.iterdir()) == {
+        technical,
+        tactical,
+    }
+
+
+def test_failed_replace_preserves_previous_export(
+    export_files: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement failure must preserve the previous XML."""
+
+    original = export_files.save_export_xml(
+        "technical",
+        XML_V1,
+    )
+
+    def fail_replace(
+        source: Path,
+        destination: Path,
+    ) -> None:
+        assert source.is_file()
+        assert destination == original
+        raise PermissionError("Simulated replacement failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            export_files.os,
+            "replace",
+            fail_replace,
+        )
+
+        with pytest.raises(
+            PermissionError,
+            match="Simulated replacement",
+        ):
+            export_files.save_export_xml(
+                "technical",
+                XML_V2,
+            )
+
+    assert original.read_bytes() == XML_V1.encode("utf-8")
+    assert list(original.parent.iterdir()) == [original]
+
+
+def test_failed_write_removes_partial_temporary_file(
+    export_files: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial write must not replace or damage the previous XML."""
+
+    original = export_files.save_export_xml(
+        "technical",
+        XML_V1,
+    )
+
+    def fail_write(
+        path: Path,
+        content: str,
+        *,
+        encoding: str,
+    ) -> int:
+        # Simulate failure after writing part of the temporary file.
+        path.write_bytes(content[:8].encode(encoding))
+        raise OSError("Simulated write failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            Path,
+            "write_text",
+            fail_write,
+        )
+
+        with pytest.raises(
+            OSError,
+            match="Simulated write failure",
+        ):
+            export_files.save_export_xml(
+                "technical",
+                XML_V2,
+            )
+
+    assert original.read_bytes() == XML_V1.encode("utf-8")
+    assert list(original.parent.iterdir()) == [original]
+
+
+@pytest.mark.parametrize("export_type", ["technical", "tactical"])
+def test_candidate_is_not_published_until_requested(
+    export_files: ModuleType,
+    export_type: str,
+) -> None:
+    """Writing a candidate must not immediately replace the export."""
+
+    final_path = export_files.get_export_path(export_type)
+
+    candidate = export_files.write_export_candidate(
+        export_type,
+        XML_V1,
+    )
+
+    assert candidate.is_file()
+    assert candidate.parent == final_path.parent
+    assert not final_path.exists()
+    assert candidate.read_bytes() == XML_V1.encode("utf-8")
+
+    result = export_files.publish_export_candidate(
+        candidate,
+        export_type,
+    )
+
+    assert result == final_path
+    assert not candidate.exists()
+    assert final_path.read_bytes() == XML_V1.encode("utf-8")
+
+    replacement = export_files.write_export_candidate(
+        export_type,
+        XML_V2,
+    )
+
+    # The published file must still contain the previous XML.
+    assert final_path.read_bytes() == XML_V1.encode("utf-8")
+
+    export_files.publish_export_candidate(
+        replacement,
+        export_type,
+    )
+
+    assert final_path.read_bytes() == XML_V2.encode("utf-8")
+    assert list(final_path.parent.iterdir()) == [final_path]
+
+
+def test_failed_candidate_write_cleans_partial_file(
+    export_files: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed candidate write must clean up its temporary file."""
+
+    original = export_files.save_export_xml(
+        "technical",
+        XML_V1,
+    )
+
+    def fail_write_bytes(
+        path: Path,
+        content: bytes,
+    ) -> int:
+        with path.open("wb") as handle:
+            handle.write(content[:8])
+
+        raise OSError("Simulated candidate write failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            Path,
+            "write_bytes",
+            fail_write_bytes,
+        )
+
+        with pytest.raises(
+            OSError,
+            match="Simulated candidate write",
+        ):
+            export_files.write_export_candidate(
+                "technical",
+                XML_V2,
+            )
+
+    assert original.read_bytes() == XML_V1.encode("utf-8")
+    assert list(original.parent.iterdir()) == [original]
