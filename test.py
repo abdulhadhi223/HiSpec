@@ -1,111 +1,147 @@
-from collections.abc import AsyncIterator
+
+from __future__ import annotations
+
+import argparse
 import os
 import re
+import signal
+import subprocess
+import sys
 from pathlib import Path
+from uuid import uuid4
 
-import pytest
-import pytest_asyncio
-from dotenv import load_dotenv
-from sqlalchemy import Enum as SAEnum, inspect, text
+from sqlalchemy import create_engine
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_ROOT / ".env.local", override=False)
+ROOT = Path(__file__).resolve().parents[2]
+SUITES = {
+    "nmdb": ("tests", "nmdb_ci_", "main.xml"),
+    "nec": ("tests_nec", "nec_ci_", "nec.xml"),
+}
 
-
-def _nec_test_url() -> URL:
-    raw = os.getenv("NEC_TEST_DATABASE_URL", "").strip()
-    if not raw:
-        raise RuntimeError("NEC_TEST_DATABASE_URL is required; runtime URLs are not test fallbacks")
-    url = make_url(raw)
-    name = url.database or ""
-    if url.get_backend_name() != "postgresql":
-        raise RuntimeError("NEC pytest requires PostgreSQL")
-    if name != "test_nec" and not re.fullmatch(r"nec_ci_[0-9a-f]{32}", name):
-        raise RuntimeError(
-            "Refusing test-table reset: use test_nec or a CI-generated nec_ci_<32 hex digits> database"
-        )
-    # Keep this conversion limited to the connection format used by the project.
-    # Do not silently discard TLS, service, host or database overrides.
+def maintenance_url(raw: str) -> URL:
+    url = make_url(raw.strip())
+    if url.get_backend_name() != "postgresql" or url.database != "postgres":
+        raise ValueError("CI_POSTGRES_URL must target the PostgreSQL maintenance database 'postgres'")
+    # These keys could override the URL destination after changing its database.
     if set(url.query) - {"options"}:
-        raise RuntimeError(
-            "Unsupported test URL query parameters; configure driver-specific TLS/connection options explicitly"
-        )
-    return url.set(drivername="postgresql+asyncpg").difference_update_query(["options"])
+        raise ValueError("Use a canonical CI URL without query parameters; configure TLS explicitly if required")
+    return url.set(drivername="postgresql+psycopg2").difference_update_query(["options"])
 
 
-# Select the test destination BEFORE test modules import the application.
-_TEST_URL = _nec_test_url()
-os.environ["TESTING"] = "1"
-os.environ["APP_MODE"] = "nec"
-os.environ["NEC_DATABASE_URL"] = _TEST_URL.render_as_string(hide_password=False)
-# Temporary compatibility for old readers; no developer-provided schema setting.
-os.environ["NEC_SCHEMA"] = "public"
+def test_environment(suite: str, admin_url: URL, database: str) -> dict[str, str]:
+    env = os.environ.copy()
+    # Do not leak old shared-schema configuration into the new test process.
+    for key in (
+        "CI_POSTGRES_URL", "DATABASE_URL", "TEST_DATABASE_URL",
+        "NEC_DATABASE_URL", "NEC_TEST_DATABASE_URL", "NEC_MIGRATION_DATABASE_URL",
+        "NEC_EXPECTED_TEST_DB", "NEC_SCHEMA", "TEST_SCHEMA",
+        "NMDB_SKIP_TEST_RESET", "PGOPTIONS", "PGDATABASE", "PGSERVICE",
+    ):
+        env.pop(key, None)
 
-
-@pytest.fixture(scope="session")
-def pg_test_url() -> str:
-    return _TEST_URL.render_as_string(hide_password=False)
-
-
-@pytest_asyncio.fixture(scope="session", loop_scope="session")
-async def async_engine(pg_test_url: str) -> AsyncIterator[AsyncEngine]:
-    from app.core.nec_base import NECBase
-    import app.models.nec.nec_models  # noqa: F401  # Register NEC tables.
-
-    if os.getenv("PYTEST_XDIST_WORKER"):
-        raise RuntimeError("Use one pytest worker per NEC database; do not use -n for this fixture")
-
-    required = {"cached_mission", "cached_sensor_catalog", "nec_sync_log"}
-    actual = {table.name for table in NECBase.metadata.tables.values()}
-    if actual != required:
-        raise RuntimeError(
-            f"Unexpected NEC metadata: {sorted(actual)}; expected {sorted(required)}"
-        )
-    for table in NECBase.metadata.tables.values():
-        if table.schema != "public":
-            raise RuntimeError(f"NEC model must target public: {table.fullname}")
-        for column in table.columns:
-            if isinstance(column.type, SAEnum):
-                if column.type.schema not in (None, "public"):
-                    raise RuntimeError(f"NEC ENUM must target public: {column.type.name}")
-                if getattr(column.type, "create_type", True) is False:
-                    raise RuntimeError(
-                        "NEC model ENUM has create_type=False; give the test metadata an explicit "
-                        "ENUM create/drop hook or enable ORM type DDL before using create_all"
-                    )
-
-    url = make_url(pg_test_url)
-    engine = create_async_engine(
-        url, echo=False, poolclass=NullPool,
-        connect_args={"server_settings": {"search_path": "public"}},
+    # pytest obtains both drivers from this one test URL as necessary.
+    url = admin_url.set(database=database).update_query_dict(
+        {"options": "-csearch_path=public"}
     )
-    try:
-        async with engine.begin() as conn:
-            database = await conn.scalar(text("SELECT current_database()"))
-            if database != url.database:
-                raise RuntimeError("Connected database does not match the validated NEC test URL")
-            schema = await conn.scalar(text("SELECT current_schema()"))
-            if schema != "public":
-                raise RuntimeError("NEC test connection must use public")
-            if await conn.scalar(text("SELECT to_regclass('public.alembic_version')")):
-                raise RuntimeError(
-                    "This database has migration history. Provision a fresh disposable NEC test database; "
-                    "do not erase migration history to bypass this check"
-                )
+    env["TESTING"] = "1"
+    env["APP_MODE"] = suite
+    # Transitional compatibility until APP_ENVIRONMENT consumers are retired.
+    env["APP_ENVIRONMENT"] = suite
+    env["COVERAGE_FILE"] = str(ROOT / f".coverage.{suite}")
+    rendered = url.render_as_string(hide_password=False)
+    if suite == "nec":
+        env["NEC_TEST_DATABASE_URL"] = rendered
+        # tests_nec/conftest.py normalizes this to asyncpg before app imports.
+        env["NEC_DATABASE_URL"] = rendered
+    else:
+        env["TEST_DATABASE_URL"] = rendered
+        env["DATABASE_URL"] = rendered
+    return env
 
-            # Only this application's metadata, only the validated test database.
-            await conn.run_sync(NECBase.metadata.drop_all)
-            await conn.run_sync(NECBase.metadata.create_all)
-            tables = await conn.run_sync(
-                lambda sync_conn: set(inspect(sync_conn).get_table_names(schema="public"))
-            )
-            if not required.issubset(tables):
-                raise RuntimeError(f"Missing NEC test tables: {sorted(required - tables)}")
-        print(f"NEC pytest database: {url.database}; schema=public; initialization=metadata")
-        yield engine
+
+def pytest_command(suite: str) -> list[str]:
+    folder, _, report = SUITES[suite]
+    return [
+        sys.executable, "-m", "pytest", folder, "-vv", "--tb=short",
+        f"--junitxml=test-results/{report}", "--cov=app",
+        f"--cov-report=xml:coverage-{suite}.xml",
+        f"--cov-report=html:coverage-{suite}-html",
+    ]
+
+
+def interrupted(signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("suite", choices=tuple(SUITES))
+    args = parser.parse_args()
+    raw = os.environ.get("CI_POSTGRES_URL", "")
+    if not raw.strip():
+        print("ERROR: CI_POSTGRES_URL is required", file=sys.stderr)
+        return 2
+
+    try:
+        admin_url = maintenance_url(raw)
+    except Exception as exc:
+        # Avoid printing a malformed URL or a password from an exception.
+        print(f"ERROR: Invalid CI database configuration ({type(exc).__name__})", file=sys.stderr)
+        return 2
+
+    _, prefix, _ = SUITES[args.suite]
+    database = f"{prefix}{uuid4().hex}"
+    if not re.fullmatch(r"(?:nmdb|nec)_ci_[0-9a-f]{32}", database):
+        raise RuntimeError("Refusing an invalid generated database name")
+
+    engine = create_engine(
+        admin_url, isolation_level="AUTOCOMMIT", poolclass=NullPool,
+        connect_args={"connect_timeout": 10},
+    )
+    quoted_db = engine.dialect.identifier_preparer.quote_identifier(database)
+    created = False
+    code = 1
+    old_handler = signal.signal(signal.SIGTERM, interrupted)
+    try:
+        with engine.connect() as conn:
+            # No IF EXISTS, no arbitrary database-name input: never reuse a DB.
+            conn.exec_driver_sql(f"CREATE DATABASE {quoted_db} TEMPLATE template0")
+        created = True
+        print(f"Created {database}; schema=public", flush=True)
+        (ROOT / "test-results").mkdir(exist_ok=True)
+        completed = subprocess.run(
+            pytest_command(args.suite), cwd=ROOT,
+            env=test_environment(args.suite, admin_url, database), check=False,
+        )
+        code = completed.returncode if completed.returncode >= 0 else 1
+    except KeyboardInterrupt:
+        code = 130
+    except Exception as exc:
+        print(f"ERROR: CI test execution failed ({type(exc).__name__})", file=sys.stderr)
+        code = 1
     finally:
-        # Per-test transaction fixtures handle data isolation; do not drop at teardown.
-        await engine.dispose()
+        # Normal completion, pytest failure, and handled interruption land here.
+        # Agent loss or SIGKILL still requires administrative orphan cleanup.
+        try:
+            if created:
+                with engine.connect() as conn:
+                    conn.exec_driver_sql(f"DROP DATABASE {quoted_db} WITH (FORCE)")
+                print(f"Removed {database}", flush=True)
+        except Exception as exc:
+            print(
+                f"ERROR: Cleanup failed for {database} ({type(exc).__name__}); "
+                "remove this CI-owned database after checking the build has stopped",
+                file=sys.stderr,
+            )
+            if code == 0:
+                code = 1
+        finally:
+            engine.dispose()
+            signal.signal(signal.SIGTERM, old_handler)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
