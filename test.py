@@ -1,129 +1,297 @@
-"""Run selected sample-data features with their declared prerequisites."""
+"""Validate NRD QA documents and resolve existing imported nomination targets."""
 
-from __future__ import annotations
+from collections import Counter
+from pathlib import Path
 
-import json
-import os
-from collections.abc import Callable
-from copy import deepcopy
-from typing import Any
-
-FEATURES = frozenset({
-    "nrd", "update_nominations", "sensor_catalog", "sensor_status", "mission_management",
-    "intercept_correlation", "ew_tracks", "activity_reports", "nec",
-})
+from lxml import etree
+from sqlalchemy import MetaData, Table, select
 
 
-class SeedError(RuntimeError):
-    """A feature failed. Completed features are recorded in report."""
-
-    def __init__(self, feature: str, cause: Exception, report: dict):
-        super().__init__(f"{feature}: {cause}")
-        self.report = {**report, "failed": feature, "error": str(cause)}
-
-
-# Defaults for linked QA runs that declare one shared platform.
-_LINKED_PARENT = {
-    "sensor_status": "sensor_catalog",
-    "mission_management": "sensor_catalog",
-    "ew_tracks": "mission_management",
-    "activity_reports": "ew_tracks",
-}
+def validate_document(xml_path, xsd_path):
+    parser = etree.XMLParser(resolve_entities=False, no_network=True)
+    schema = etree.XMLSchema(etree.parse(str(Path(xsd_path)), parser))
+    document = etree.parse(str(Path(xml_path)), parser)
+    schema.assertValid(document)
 
 
-def _execution_order(features: dict, selected: list[str], linked: bool = False) -> list[str]:
-    order: list[str] = []
-    active: list[str] = []
-
-    def visit(name: str) -> None:
-        if name in order:
-            return
-        if name in active:
-            raise ValueError("Dependency cycle: " + " -> ".join([*active, name]))
-        if name not in features:
-            raise ValueError(f"Missing feature configuration for {name!r}")
-        settings = features[name]
-        if not isinstance(settings, dict) or settings.keys() - {"depends_on", "options"}:
-            raise ValueError(f"{name}: expected a feature object with depends_on/options")
-        parent = _LINKED_PARENT.get(name) if linked else None
-        deps = settings.get("depends_on", [parent] if parent else [])
-        if not isinstance(deps, list) or not all(isinstance(key, str) for key in deps):
-            raise ValueError(f"{name}.depends_on must be a list of feature names")
-        if not isinstance(settings.get("options", {}), dict):
-            raise ValueError(f"{name}.options must be an object")
-        active.append(name)
-        for dep in deps:
-            visit(dep)
-        active.pop()
-        order.append(name)
-
-    for name in selected:
-        visit(name)
-    return order
-
-
-def run(
-    config: dict, handlers: dict[str, Callable], sessions: dict[str, Callable],
-    only: list[str] | None = None,
-) -> dict:
-    """Each callback gets (session, dataset, options, previously committed results)."""
-    if not isinstance(config, dict):
-        raise ValueError("Expected a configuration object")
-    dataset = config.get("dataset")
-    if not isinstance(dataset, str) or not dataset.strip():
-        raise ValueError("A nonempty dataset name is required")
-    features = config.get("features")
-    if not isinstance(features, dict) or not features:
-        raise ValueError("Configure at least one feature")
-    unknown = set(features) - FEATURES
-    if unknown:
-        raise ValueError(f"Unknown feature names: {sorted(unknown)}")
-    if only is not None and (not isinstance(only, list) or not only
-                             or not all(isinstance(k, str) for k in only)):
-        raise ValueError("Feature selection must be a nonempty list of names")
-    platform = config.get("platform")
-    if "platform" in config and (
-        not isinstance(platform, dict)
-        or platform.keys() != {"platform_type", "platform_instance_id"}
-        or not all(isinstance(v, str) and v.strip() for v in platform.values())
-    ):
-        raise ValueError("platform requires platform_type and platform_instance_id")
-    order = _execution_order(features, list(features) if only is None else only, platform is not None)
-    targets = {name: "nec" if name == "nec" else "nmdb" for name in order}
-    missing = [name for name in order if not callable(handlers.get(name))]
-    if missing:
-        raise ValueError(f"Missing feature handlers: {', '.join(missing)}")
-    for target in dict.fromkeys(targets.values()):
-        if not callable(sessions.get(target)):
-            raise ValueError(f"Missing session factory for {target!r}")
-
-    completed: dict[str, Any] = {}
-    report = {"dataset": dataset, "completed": completed}
-    for name in order:
+def nrd(db, dataset, options, prior_results):
+    for kind in ("technical", "tactical"):
+        document = options[kind]
         try:
-            with sessions[targets[name]]() as db:
-                try:
-                    options = deepcopy(features[name].get("options", {}))
-                    if platform is not None and name in {"sensor_catalog", "mission_management"}:
-                        field, value = ("platform", platform) if name == "sensor_catalog" else ("platforms", [platform])
-                        if field in options and options[field] != value:
-                            raise ValueError(f"{name}.{field} conflicts with the shared platform")
-                        options[field] = deepcopy(value)
-                    if name in {"sensor_status", "mission_management"} and "created_by" not in options:
-                        actor = os.environ.get("NMDB_SEED_ACTOR_ID")
-                        if not actor:
-                            raise ValueError("Set NMDB_SEED_ACTOR_ID to the QA user's UUID")
-                        options["created_by"] = actor
-                    result = handlers[name](db, dataset, options, deepcopy(completed))
-                    if not isinstance(result, dict):
-                        raise TypeError("A feature must return a JSON-compatible dictionary")
-                    # Capture plain data before commit can expire ORM objects.
-                    snapshot = json.loads(json.dumps(result, allow_nan=False))
-                    db.commit()
-                    completed[name] = snapshot
-                except Exception:
-                    db.rollback()
-                    raise
-        except Exception as exc:
-            raise SeedError(name, exc, report) from exc
-    return report
+            validate_document(document["xml"], document["xsd"])
+        except (OSError, etree.LxmlError) as exc:
+            raise ValueError(f"{kind} XML/XSD validation failed: {exc}") from exc
+
+    target = options["nomination_targets"]
+    names = target["qa_names"]
+    if (
+        not isinstance(names, list)
+        or len(names) != 3
+        or not all(isinstance(name, str) and name.strip() for name in names)
+        or len(set(names)) != 3
+    ):
+        raise ValueError("Provide three distinct QA display names")
+
+    table = Table(
+        target["table"],
+        MetaData(),
+        schema=target.get("schema"),
+        autoload_with=db.connection(),
+    )
+    primary_key = list(table.primary_key.columns)
+    if len(primary_key) != 1:
+        raise ValueError(f"{table.fullname}: expected a single-column primary key")
+
+    field_name = target["text_field"]
+    if field_name not in table.c:
+        raise ValueError(f"{table.fullname}: unknown text field {field_name!r}")
+
+    text_column = table.c[field_name]
+    query = select(primary_key[0], text_column).where(text_column.in_(names))
+    if "deleted_at" in table.c:
+        query = query.where(table.c.deleted_at.is_(None))
+
+    rows = db.execute(query).all()
+    counts = Counter(value for _, value in rows)
+    ambiguous = [name for name in names if counts[name] != 1]
+    if ambiguous:
+        raise ValueError(
+            f"Expected exactly one imported QA row per name in "
+            f"{table.fullname}.{field_name}. Check {ambiguous}"
+        )
+
+    return {
+        "validated_documents": ["technical", "tactical"],
+        "qa_edit_targets": [
+            {
+                "entity_type": target["entity_type"],
+                "entity_id": str(row_id),
+                "field_name": field_name,
+                "current_text": value,
+            }
+            for row_id, value in rows
+        ],
+    }
+
+
+"""Seed administrative proposal examples against imported QA text fields."""
+
+from datetime import datetime, timezone
+from uuid import NAMESPACE_URL, uuid5
+
+from sqlalchemy import select
+
+from .enum_values import resolve_enum
+
+
+def _ensure(db, model, row_id, **values):
+    existing = db.get(model, row_id)
+    if existing is None:
+        db.add(model(id=row_id, **values))
+        db.flush()
+        return 1
+
+    for field, expected in values.items():
+        if getattr(existing, field) != expected:
+            raise ValueError(f"Saved {model.__name__} {row_id} differs at {field}")
+    return 0
+
+
+def update_nominations(db, dataset, options, prior_results):
+    from app.models.nrd.nrd_update_proposals import (
+        EntityLock,
+        ProposedCellEdit,
+        ProposedUpdate,
+    )
+
+    if options:
+        raise ValueError("Nomination samples use QA edit targets returned by nrd")
+
+    targets = prior_results.get("nrd", {}).get("qa_edit_targets", [])
+    required = ("entity_type", "entity_id", "field_name", "current_text")
+    if not isinstance(targets, list) or len(targets) < 3:
+        raise ValueError(
+            "NRD must return three distinct imported QA entities "
+            "with editable text fields"
+        )
+
+    for item in targets:
+        if not isinstance(item, dict) or not all(
+            isinstance(item.get(k), str) for k in required
+        ):
+            raise ValueError(f"Each QA edit target needs string values for {required}")
+        if not all(item[k].strip() for k in required[:3]):
+            raise ValueError("Empty QA edit target identity")
+
+    ordered = sorted(targets, key=lambda t: tuple(t[k] for k in required[:3]))
+    if len({(t["entity_type"], t["entity_id"]) for t in ordered}) != len(ordered):
+        raise ValueError("Supply one QA text field per distinct imported entity")
+
+    namespace = uuid5(NAMESPACE_URL, f"nmdb-qa/nominations/{dataset}")
+    when = datetime(2026, 1, 1, 8, tzinfo=timezone.utc)
+    edit = resolve_enum(ProposedCellEdit.delta_type, "EDIT")
+    ids = []
+    represented = set()
+    created = 0
+
+    scenarios = ("DRAFT", "DRAFT", "REJECTED")
+    for index, (target, state) in enumerate(zip(ordered[:3], scenarios, strict=True)):
+        kind, entity, field, current = (target[k] for k in required)
+        key = uuid5(namespace, str(index))
+        owner = f"qa-author-{index % 2 + 1}"
+        locked = state == "DRAFT"
+        dirty = index == 1
+        status = resolve_enum(ProposedUpdate.status, state)
+
+        created += _ensure(
+            db, ProposedUpdate, key,
+            original_owner_id=owner,
+            locked_to=owner if locked else None,
+            status=status,
+            is_dirty=dirty,
+            dirty_since=when if dirty else None,
+            is_deleted=False,
+            reviewed_by=None if locked else "qa-reviewer",
+            submitted_at=None if locked else when,
+            rejected_at=None if locked else when,
+        )
+
+        original = current + " (previous QA value)" if dirty else current
+        _ensure(
+            db, ProposedCellEdit, uuid5(key, "edit"),
+            proposed_update_id=key,
+            entity_type=kind,
+            entity_id=entity,
+            field_name=field,
+            delta_type=edit,
+            original_value=original,
+            proposed_value=current + " (QA edit)",
+            extract_current_value=current if dirty else None,
+            relation_data=None,
+            is_dirty=dirty,
+            dirty_since=when if dirty else None,
+            is_deleted=False,
+        )
+
+        lock_id = uuid5(key, "lock")
+        if locked:
+            _ensure(
+                db, EntityLock, lock_id,
+                entity_type=kind,
+                entity_id=entity,
+                proposed_update_id=key,
+            )
+
+        expected_locks = {lock_id} if locked else set()
+        actual_locks = set(
+            db.scalars(
+                select(EntityLock.id).where(EntityLock.proposed_update_id == key)
+            )
+        )
+        if actual_locks != expected_locks:
+            raise ValueError(f"Unexpected locks on sample proposal {key}")
+
+        represented.add(status)
+        ids.append(str(key))
+
+    all_states = set(ProposedUpdate.status.property.columns[0].type.enum_class)
+    return {
+        "ids": ids,
+        "created": created,
+        "reused": len(ids) - created,
+        "missing_states": sorted(s.name for s in all_states - represented),
+        "checks": {
+            "states": represented == all_states,
+            "locks": True,
+            "multiple_users": True,
+            "dirty_proposal": True,
+        },
+    }
+
+
+"""Register inert mission artifact samples for NMDB QA screens."""
+
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from uuid import UUID, uuid5
+
+
+def _member(column, label):
+    members = column.property.columns[0].type.enum_class
+    for member in members:
+        if label in (member.name, member.value):
+            return member
+    raise ValueError(f"{column.key}: choose one of {[m.name for m in members]}")
+
+
+def _write_sample(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        temp = NamedTemporaryFile(dir=path.parent, delete=False)
+        temp_path = Path(temp.name)
+        try:
+            with temp:
+                temp.write(content)
+            os.link(temp_path, path)
+        except FileExistsError:
+            pass
+        finally:
+            temp_path.unlink(missing_ok=True)
+    if path.read_bytes() != content:
+        raise ValueError(f"Existing QA file has different content: {path}")
+
+
+def _register(db, model, mission_id, file_type, path, content, now, **extra):
+    key = uuid5(mission_id, f"nmdb-qa/artifacts/v1/{model.__tablename__}")
+    fields = dict(mission_id=mission_id, file_type=file_type, file_path=str(path), **extra)
+    item = db.get(model, key)
+    if item is not None:
+        if any(getattr(item, field) != value for field, value in fields.items()):
+            raise ValueError(f"QA artifact metadata differs for {key}")
+        if item.purged_at is not None or item.expires_at <= now:
+            raise ValueError(f"QA artifact {key} has been purged or expired")
+    _write_sample(path, content)
+    if item is None:
+        db.add(model(id=key, **fields, generated_at=now,
+                     expires_at=now + timedelta(days=30), download_url=None))
+    return "created" if item is None else "reused"
+
+
+def with_qa_artifacts(mission_handler):
+    def run(db, dataset, options, prior_results):
+        options = dict(options)
+        config = options.pop("qa_artifacts", None)
+        if config is None:
+            return mission_handler(db, dataset, options, prior_results)
+
+        from app.models.mission_models import SensorProgrammingFile, ThreatExport
+
+        root = Path(config["directory"]).resolve()
+        export_type = _member(ThreatExport.file_type, config["export_file_type"])
+        mdf_type = _member(SensorProgrammingFile.file_type, "MDF")
+        result = mission_handler(db, dataset, options, prior_results)
+        counts = {key: {"created": 0, "reused": 0} for key in ("export", "mdf_sample")}
+        now = datetime.now(timezone.utc)
+
+        for value in result["ids"]:
+            mission_id = UUID(str(value))
+            folder = root / str(mission_id)
+            xml_path = folder / "qa-export-sample.xml"
+            xml = f'<qa-sample mission="{mission_id}" purpose="listing-test"/>\n'.encode()
+            state = _register(db, ThreatExport, mission_id, export_type, xml_path, xml, now)
+            counts["export"][state] += 1
+
+            state = _register(
+                db, SensorProgrammingFile, mission_id, mdf_type,
+                folder / "qa-placeholder.mdf", b"QA SAMPLE ONLY - no programming data\n",
+                now, source_filename=xml_path.name,
+            )
+            counts["mdf_sample"][state] += 1
+
+        db.flush()
+        result["qa_artifact_fixtures"] = counts
+        return result
+
+    return run
