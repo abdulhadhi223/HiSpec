@@ -712,3 +712,91 @@ class Schema:
 
 
 
+def discover_nomination_targets(db, cfg):
+    connection = db.connection()
+    inspector = inspect(connection)
+    metadata = MetaData()
+
+    table_prefix = cfg["table_prefix"]
+    field_name = cfg.get("text_field", "name")
+    qa_prefix = cfg["qa_prefix"]
+
+    if not isinstance(table_prefix, str) or not table_prefix.startswith("nrd_"):
+        raise ValueError("table_prefix must start with 'nrd_'")
+    if not isinstance(qa_prefix, str) or not qa_prefix.strip():
+        raise ValueError("qa_prefix must be a nonempty string")
+
+    table_names = sorted(
+        name for name in inspector.get_table_names(schema="public")
+        if name.startswith(table_prefix)
+    )
+
+    groups = []
+    counts = {}
+
+    for name in table_names:
+        table = Table(
+            name,
+            metadata,
+            schema="public",
+            autoload_with=connection,
+            resolve_fks=False,
+        )
+        columns = table.c
+
+        # A draft EDIT needs an existing object and an editable text field.
+        if "object_id" not in columns or field_name not in columns:
+            continue
+
+        field = columns[field_name]
+        if not isinstance(field.type, String) or isinstance(field.type, Enum):
+            continue
+
+        query = (
+            select(columns.object_id, field)
+            .where(field.startswith(qa_prefix, autoescape=True))
+            .order_by(columns.object_id)
+        )
+
+        if "to_be_removed" in columns:
+            removed = func.lower(columns.to_be_removed.cast(String))
+            query = query.where(func.coalesce(removed, "false") == "false")
+
+        if "deleted_at" in columns:
+            query = query.where(columns.deleted_at.is_(None))
+
+        targets = []
+        seen_ids = set()
+
+        for object_id, current_text in db.execute(query):
+            if not isinstance(object_id, str) or not object_id.strip():
+                continue
+            if object_id in seen_ids:
+                raise ValueError(
+                    f"{name}: multiple active QA rows have object_id {object_id!r}"
+                )
+            seen_ids.add(object_id)
+            targets.append({
+                "entity_type": name,
+                "entity_id": object_id,
+                "field_name": field_name,
+                "current_text": current_text,
+            })
+
+        counts[name] = len(targets)
+        if targets:
+            groups.append(targets)
+
+    # Take one target per table per round so the first table cannot
+    # consume the entire proposal count when other tables have matches.
+    ordered_targets = [
+        target
+        for group in zip_longest(*groups)
+        for target in group
+        if target is not None
+    ]
+
+    return {
+        "qa_edit_targets": ordered_targets,
+        "matching_targets_by_table": counts,
+    }
