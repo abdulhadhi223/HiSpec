@@ -1,203 +1,91 @@
-    names = cfg.get("qa_names")
-    query = select(table.c.object_id, field)
+"""Resolve synthetic XML links inside each document, then audit the saved records."""
 
-    if names is None:
-        # Count mode: discover existing rows belonging to this QA fixture.
-        prefix = cfg.get("qa_prefix", "QA-557-")
-        if not isinstance(prefix, str) or not prefix.strip():
-            raise ValueError("qa_prefix must be a nonempty string")
-        query = query.where(field.startswith(prefix, autoescape=True))
-    else:
-        # Existing configs can still select specific QA names.
-        if not isinstance(names, list) or not names:
-            raise ValueError("qa_names must be a nonempty list")
-        if not all(isinstance(value, str) and value.strip() for value in names):
-            raise ValueError("Each qa_names entry must be a nonempty string")
-        if len(set(names)) != len(names):
-            raise ValueError("qa_names contains duplicates")
-        query = query.where(field.in_(names))
-
-    if "to_be_removed" in table.c:
-        removed = func.lower(table.c.to_be_removed.cast(String))
-        query = query.where(func.coalesce(removed, "false") == "false")
-    if "deleted_at" in table.c:
-        query = query.where(table.c.deleted_at.is_(None))
-
-    targets = []
-    seen_ids = set()
-    seen_names = set()
-    for object_id, current in db.execute(query.order_by(table.c.object_id)):
-        if not isinstance(object_id, str) or not object_id.strip():
-            raise ValueError(f"Missing object_id for {current!r}")
-        if object_id in seen_ids:
-            raise ValueError(f"Multiple eligible rows have object_id {object_id!r}")
-        if names is not None and current in seen_names:
-            raise ValueError(f"Multiple eligible rows match QA name {current!r}")
-        seen_ids.add(object_id)
-        seen_names.add(current)
-        targets.append({
-            "entity_type": name,
-            "entity_id": object_id,
-            "field_name": field.name,
-            "current_text": current,
-        })
-
-    if names is not None:
-        missing = [value for value in names if value not in seen_names]
-        if missing:
-            raise ValueError(f"No eligible row in {name}.{field.name} for {missing}")
-        positions = {value: index for index, value in enumerate(names)}
-        targets.sort(key=lambda target: positions[target["current_text"]])
-
-    return {
-        "validated_documents": ["technical", "tactical"],
-        "qa_edit_targets": targets,
-    }
-
-
-
-    targets = prior_results.get("nrd", {}).get("qa_edit_targets")
-    if targets is None:
-        raise ValueError("The nrd feature must return qa_edit_targets")
-
-    count = options.get("count", len(targets))
-    if type(count) is not int or count < 1:
-        raise ValueError("update_nominations.options.count must be a positive integer")
-
-    if len(targets) < count:
-        raise ValueError(
-            f"Requested {count} draft proposals, found {len(targets)} matching "
-            f"QA objects, shortfall {count - len(targets)}. No proposals submitted."
-        )
-
-    targets = targets[:count]
-
-
-
------
-"""Load local XSD 1.0 documents and resolve declarations for fixture generation."""
-
-from pathlib import Path
-from urllib.parse import urljoin, urlsplit
-from urllib.request import url2pathname
-
+from collections import defaultdict
 from lxml import etree
 
-XSD_NS = "http://www.w3.org/2001/XMLSchema"
-XS = "{" + XSD_NS + "}"
+
+SIDES = ("Source", "Destination")
+FIELDS = {"ObjectId", "SourceClass", "DestinationClass", "SourceId", "DestinationId"}
 
 
-def _local(uri):
-    parts = urlsplit(uri)
-    if parts.scheme != "file" or parts.netloc or parts.query or parts.fragment:
-        raise ValueError(f"Expected a local XSD file, got {uri!r}")
-    return Path(url2pathname(parts.path))
-
-
-class _LocalOnly(etree.Resolver):
-    def resolve(self, url, public_id, context):
-        if url.startswith("file:"):
-            path = _local(url)
-        else:
-            path = Path(url)
-            if not path.is_absolute() or str(path).startswith(("//", "\\\\")):
-                raise ValueError(f"Expected a local XSD file, got {url!r}")
-        return self.resolve_filename(str(path), context)
-
-
-class Schema:
-    """Global declarations include each namespace reachable via local XSD files."""
-
-    def __init__(self, path):
-        self._ns = {}
-        self._decls = {}
-        self._seen = set()
-        parser = etree.XMLParser(no_network=True, resolve_entities=False, load_dtd=False)
-        parser.resolvers.add(_LocalOnly())
-        self._parser = parser
-        entry = self._load(Path(path).resolve())
-        self.validator = etree.XMLSchema(entry.getroottree())
-        entry_ns = self._ns[entry]
-        self.globals = [node for (kind, uri, _), node in self._decls.items()
-                        if kind == "element" and uri == entry_ns]
-
-    def _load(self, path, inherited=""):
-        root = etree.parse(path.as_uri(), self._parser).getroot()
-        if root.tag != XS + "schema" or root.getroottree().docinfo.doctype:
-            raise ValueError(f"Expected an XML Schema document without a DOCTYPE in {path}")
-        namespace = root.get("targetNamespace", inherited)
-        identity = (path, namespace)
-        if identity in self._seen:
-            return root
-        self._seen.add(identity)
-        self._ns[root] = namespace
-        for node in root:
-            if not isinstance(node.tag, str):
+def index_document(root):
+    objects = {}
+    pools = defaultdict(list)
+    links = []
+    class_tags = {}
+    for record in root.iter():
+        fields = {}
+        for child in record:
+            if not isinstance(child.tag, str):
                 continue
-            if node.tag in (XS + "redefine", XS + "override"):
-                raise ValueError(f"Schema redefinition is unsupported in {path}")
-            if node.tag in (XS + "include", XS + "import"):
-                location = node.get("schemaLocation")
-                if location:
-                    base = node.base or path.as_uri()
-                    if Path(base).is_absolute():
-                        base = Path(base).as_uri() + ("/" if base.endswith("/") else "")
-                    child = _local(urljoin(base, location)).resolve()
-                    self._load(child, namespace if node.tag == XS + "include" else "")
-            elif node.tag.startswith(XS) and node.get("name"):
-                kind = etree.QName(node).localname
-                self._decls[kind, namespace, node.get("name")] = node
-        return root
+            name = etree.QName(child).localname
+            if name in FIELDS:
+                if name in fields:
+                    raise ValueError(f"{record.tag}: multiple {name} fields")
+                fields[name] = child
+        if not fields:
+            continue
+        if "ObjectId" in fields:
+            identity = fields["ObjectId"].text
+            if not identity or not identity.strip() or identity in objects:
+                raise ValueError(f"{record.tag}: empty or duplicate ObjectId {identity!r}")
+            objects[identity] = record
+        if fields.keys() - {"ObjectId"}:
+            missing = FIELDS - fields.keys()
+            if missing:
+                raise ValueError(f"{record.tag}: incomplete link, missing {sorted(missing)}")
+            links.append((record, fields))
+        else:
+            cls = etree.QName(record).localname
+            if class_tags.setdefault(cls, record.tag) != record.tag:
+                raise ValueError(f"Class {cls!r} is ambiguous across namespaces")
+            pools[cls].append(identity)
+    return objects, pools, links
 
-    def _qualified(self, node, lexical):
-        if ":" in lexical:
-            prefix, name = lexical.split(":", 1)
-            if prefix == "xml":
-                return "http://www.w3.org/XML/1998/namespace", name
-            return node.nsmap[prefix], name
-        uri = node.nsmap.get(None, "")
-        root = node.getroottree().getroot()
-        if not uri and root.get("targetNamespace") is None:
-            uri = self._ns[root]
-        return uri, lexical
 
-    def resolve(self, node, kind, qname):
-        uri, name = self._qualified(node, qname)
-        return self._decls.get((kind, uri, name))
+def resolve_links(root, declarations, accepts, classes_for):
+    _, pools, links = index_document(root)
+    offsets = defaultdict(int)
+    for record, fields in links:
+        for side in SIDES:
+            class_field = fields[side + "Class"]
+            id_field = fields[side + "Id"]
+            preferred = class_field.text
+            cls_decl = declarations[class_field]
+            for cls in classes_for(cls_decl, preferred):
+                pool = pools.get(cls, ())
+                if not pool or not accepts(cls_decl, cls):
+                    continue
+                key = (record.tag, side, cls)
+                for _ in range(len(pool)):
+                    identity = pool[offsets[key] % len(pool)]
+                    offsets[key] += 1
+                    if accepts(declarations[id_field], identity):
+                        class_field.text = cls
+                        id_field.text = identity
+                        break
+                else:
+                    continue
+                break
+            else:
+                raise ValueError(f"{record.tag} {fields['ObjectId'].text}: no same-document "
+                                 f"object satisfies {side}Class ({preferred!r}) and {side}Id")
 
-    def declaration(self, node):
-        ref = node.get("ref")
-        if ref is None:
-            return node
-        decl = self.resolve(node, etree.QName(node).localname, ref)
-        if decl is None:
-            raise ValueError(f"Unresolved {etree.QName(node).localname} reference {ref!r}")
-        return decl
 
-    def tag(self, node):
-        node = self.declaration(node)
-        name = node.get("name")
-        if not name:
-            raise ValueError(f"Expected a named declaration at line {node.sourceline}")
-        root = node.getroottree().getroot()
-        kind = etree.QName(node).localname
-        form = node.get("form", root.get(kind + "FormDefault", "unqualified"))
-        uri = self._ns[root] if node.getparent() is root or form == "qualified" else ""
-        return f"{{{uri}}}{name}" if uri else name
-
-    def type_of(self, node):
-        node = self.declaration(node)
-        for kind in ("complexType", "simpleType"):
-            typ = node.find(XS + kind)
-            if typ is not None:
-                return typ
-        name = node.get("type")
-        if name:
-            for kind in ("complexType", "simpleType"):
-                typ = self.resolve(node, kind, name)
-                if typ is not None:
-                    return typ
-        return None
+def audit_links(root, earlier_ids):
+    objects, pools, links = index_document(root)
+    duplicates = earlier_ids.intersection(objects)
+    if duplicates:
+        raise ValueError(f"ObjectId repeated across XML files: {min(duplicates)!r}")
+    for record, fields in links:
+        for side in SIDES:
+            identity = fields[side + "Id"].text
+            target = objects.get(identity)
+            cls = fields[side + "Class"].text
+            if target is None or cls not in pools or etree.QName(target).localname != cls:
+                raise ValueError(f"{record.tag}: unresolved {side} reference {cls}/{identity}")
+    earlier_ids.update(objects)
+    return len(links) * len(SIDES)
 
 
 """Generate inert lexical values for XML Schema QA fixtures."""
@@ -376,17 +264,43 @@ def _compound_value(node, index, resolve, facets):
     raise ValueError(f"No supported union member at line {node.sourceline}")
 
 
-def sample_value(decl, serial, variant, resolve):
-    """Produce a synthetic lexical value for an element or attribute declaration."""
-    for key in ("fixed", "default"):
-        if key in decl.attrib:
-            return decl.attrib[key]
+def _value_type(decl, resolve):
     restrictions = []
     kind = _describe(decl, resolve, restrictions)
     layers = tuple(tuple((etree.QName(child).localname, child.get("value"))
                          for child in restriction if isinstance(child.tag, str)
                          and child.tag.startswith(_XS) and etree.QName(child).localname in _FACETS)
                    for restriction in restrictions)
+    return kind, layers
+
+
+def accepts_value(decl, value, resolve):
+    """Test a proposed scalar against the field's fixed value and XSD type."""
+    if "fixed" in decl.attrib and decl.get("fixed") != value:
+        return False
+    kind, layers = _value_type(decl, resolve)
+    if isinstance(kind, etree._Element):
+        raise ValueError(f"Compound types are unsupported for identity fields at line {decl.sourceline}")
+    probe = etree.Element("v")
+    probe.text = value
+    return _validator(kind, layers).validate(probe)
+
+
+def class_values(decl, preferred, resolve):
+    """Prefer the sampled class; alternatives must be explicitly enumerated."""
+    if "fixed" in decl.attrib:
+        return [decl.get("fixed")]
+    _, layers = _value_type(decl, resolve)
+    values = [value for layer in layers for facet, value in layer if facet == "enumeration"]
+    return list(dict.fromkeys([preferred, *values]))
+
+
+def sample_value(decl, serial, variant, resolve):
+    """Produce a synthetic lexical value for an element or attribute declaration."""
+    for key in ("fixed", "default"):
+        if key in decl.attrib:
+            return decl.attrib[key]
+    kind, layers = _value_type(decl, resolve)
     index = serial + variant
     facets = {name: value for layer in reversed(layers) for name, value in layer}
     enums = [value for layer in layers for name, value in layer if name == "enumeration"]
@@ -407,6 +321,8 @@ def sample_value(decl, serial, variant, resolve):
     raise ValueError(f"{decl.get('name') or decl.get('ref') or decl.tag}: no synthetic value "
                      f"for xs:{kind} meeting facets {sorted(facets)} (line {decl.sourceline})")
 
+
+
 """Generate and independently count structural XML fixtures from local XSD 1.0 files."""
 
 import argparse
@@ -415,11 +331,19 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import tempfile
+from hashlib import sha256
+from uuid import NAMESPACE_URL, uuid5
 
 from lxml import etree
 
-from fixture_schema import Schema, XS
-from fixture_values import sample_value
+if __package__:
+    from .fixture_links import audit_links, resolve_links
+    from .fixture_schema import Schema, XS
+    from .fixture_values import accepts_value, class_values, sample_value
+else:
+    from fixture_links import audit_links, resolve_links
+    from fixture_schema import Schema, XS
+    from fixture_values import accepts_value, class_values, sample_value
 
 
 @dataclass
@@ -508,11 +432,36 @@ def compile_particle(schema, use, parent=(), stack=(), repeated=False):
 
 
 class Writer:
-    def __init__(self, schema, count):
+    def __init__(self, schema, count, identity_seed):
         self.schema = schema
         self.goal = count
         self.counts = Counter()
         self.serial = 0
+        self.identity_seed = identity_seed
+        self.issued = set()
+        self.declarations = {}
+
+    def accepts(self, decl, value):
+        return accepts_value(decl, value, self.schema.resolve)
+
+    def classes_for(self, decl, preferred):
+        return class_values(decl, preferred, self.schema.resolve)
+
+    def object_id(self, decl):
+        self.serial += 1
+        serial = self.serial
+        token = uuid5(NAMESPACE_URL, f"{self.identity_seed}/{serial}")
+        for candidate in (f"QA-{token}", str(token), token.hex):
+            if candidate not in self.issued and self.accepts(decl, candidate):
+                self.issued.add(candidate)
+                return candidate
+        # Some schemas restrict IDs to short strings, numbers or enum values.
+        for offset in range(max(2, len(self.issued) + 1)):
+            candidate = sample_value(decl, serial, offset, self.schema.resolve)
+            if candidate not in self.issued:
+                self.issued.add(candidate)
+                return candidate
+        raise ValueError(f"Cannot generate a unique ObjectId at XSD line {decl.sourceline}")
 
     def need(self, p):
         return sum(max(0, self.goal - self.counts[path]) for path in p.covers)
@@ -527,7 +476,7 @@ class Writer:
         repetitions = 0
         while p.maximum is None or repetitions < p.maximum:
             before = self.need(p)
-            include_optional_value = repetitions == 0 and not p.covers
+            include_optional_value = repetitions == 0
             if repetitions >= p.minimum and not before and not include_optional_value:
                 break
             if p.kind == "element":
@@ -539,7 +488,13 @@ class Writer:
                     val = use.get("fixed", use.get("default"))
                     el.set(self.schema.tag(decl), val if val is not None else self.value(decl))
                 if p.text:
-                    el.text = self.value(p.decl)
+                    local = etree.QName(el).localname
+                    if local in ("SourceId", "DestinationId", "SourceClass", "DestinationClass"):
+                        self.declarations[el] = p.decl
+                    if local == "ObjectId":
+                        el.text = self.object_id(p.decl)
+                    elif local not in ("SourceId", "DestinationId"):
+                        el.text = self.value(p.decl)
                 for child in p.children:
                     self.emit(child, el)
             elif p.kind == "choice":
@@ -572,24 +527,31 @@ def generate(schema_path, root_name, count, out):
     if not root.covers:
         root.entity = True
         root.covers.add(root.path)
-    writer = Writer(schema, count)
+    identity_seed = sha256(schema_path.read_bytes()).hexdigest()
+    writer = Writer(schema, count, identity_seed)
+    audited_ids = set()
+    endpoints = 0
     observed = Counter()
     docs = 0
     while min(observed[path] for path in root.covers) < count:
         remaining = writer.need(root)
         wrapper = etree.Element("fixture")
+        writer.declarations.clear()
         writer.emit(root, wrapper)
+        resolve_links(wrapper[0], writer.declarations, writer.accepts, writer.classes_for)
         docs += 1
         dest = out / f"{schema_path.stem}-{docs:03d}.xml"
         etree.ElementTree(wrapper[0]).write(str(dest), encoding="UTF-8",
                                             xml_declaration=True, pretty_print=True)
         saved = etree.parse(str(dest))
         schema.validator.assertValid(saved)
+        endpoints += audit_links(saved.getroot(), audited_ids)
         recount(saved.getroot(), root.covers, observed)
         if writer.need(root) >= remaining:
             raise ValueError(f"No coverage progress in document {docs}")
     return {"schema": str(schema_path), "documents_validated": docs,
-            "minimum_requested": count,
+            "minimum_requested": count, "unique_object_ids": len(audited_ids),
+            "verified_endpoints": endpoints,
             "coverage": [{"path": list(path), "entries": observed[path]}
                          for path in sorted(root.covers)]}
 
@@ -622,4 +584,131 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+"""Load local XSD 1.0 documents and resolve declarations for fixture generation."""
+
+from pathlib import Path
+from urllib.parse import urljoin, urlsplit
+from urllib.request import url2pathname
+
+from lxml import etree
+
+XSD_NS = "http://www.w3.org/2001/XMLSchema"
+XS = "{" + XSD_NS + "}"
+
+
+def _local(uri):
+    parts = urlsplit(uri)
+    if parts.scheme != "file" or parts.netloc or parts.query or parts.fragment:
+        raise ValueError(f"Expected a local XSD file, got {uri!r}")
+    return Path(url2pathname(parts.path))
+
+
+class _LocalOnly(etree.Resolver):
+    def resolve(self, url, public_id, context):
+        if url.startswith("file:"):
+            path = _local(url)
+        else:
+            path = Path(url)
+            if not path.is_absolute() or str(path).startswith(("//", "\\\\")):
+                raise ValueError(f"Expected a local XSD file, got {url!r}")
+        return self.resolve_filename(str(path), context)
+
+
+class Schema:
+    """Global declarations include each namespace reachable via local XSD files."""
+
+    def __init__(self, path):
+        self._ns = {}
+        self._decls = {}
+        self._seen = set()
+        parser = etree.XMLParser(no_network=True, resolve_entities=False, load_dtd=False)
+        parser.resolvers.add(_LocalOnly())
+        self._parser = parser
+        entry = self._load(Path(path).resolve())
+        self.validator = etree.XMLSchema(entry.getroottree())
+        entry_ns = self._ns[entry]
+        self.globals = [node for (kind, uri, _), node in self._decls.items()
+                        if kind == "element" and uri == entry_ns]
+
+    def _load(self, path, inherited=""):
+        root = etree.parse(path.as_uri(), self._parser).getroot()
+        if root.tag != XS + "schema" or root.getroottree().docinfo.doctype:
+            raise ValueError(f"Expected an XML Schema document without a DOCTYPE in {path}")
+        namespace = root.get("targetNamespace", inherited)
+        identity = (path, namespace)
+        if identity in self._seen:
+            return root
+        self._seen.add(identity)
+        self._ns[root] = namespace
+        for node in root:
+            if not isinstance(node.tag, str):
+                continue
+            if node.tag in (XS + "redefine", XS + "override"):
+                raise ValueError(f"Schema redefinition is unsupported in {path}")
+            if node.tag in (XS + "include", XS + "import"):
+                location = node.get("schemaLocation")
+                if location:
+                    base = node.base or path.as_uri()
+                    if Path(base).is_absolute():
+                        base = Path(base).as_uri() + ("/" if base.endswith("/") else "")
+                    child = _local(urljoin(base, location)).resolve()
+                    self._load(child, namespace if node.tag == XS + "include" else "")
+            elif node.tag.startswith(XS) and node.get("name"):
+                kind = etree.QName(node).localname
+                self._decls[kind, namespace, node.get("name")] = node
+        return root
+
+    def _qualified(self, node, lexical):
+        if ":" in lexical:
+            prefix, name = lexical.split(":", 1)
+            if prefix == "xml":
+                return "http://www.w3.org/XML/1998/namespace", name
+            return node.nsmap[prefix], name
+        uri = node.nsmap.get(None, "")
+        root = node.getroottree().getroot()
+        if not uri and root.get("targetNamespace") is None:
+            uri = self._ns[root]
+        return uri, lexical
+
+    def resolve(self, node, kind, qname):
+        uri, name = self._qualified(node, qname)
+        return self._decls.get((kind, uri, name))
+
+    def declaration(self, node):
+        ref = node.get("ref")
+        if ref is None:
+            return node
+        decl = self.resolve(node, etree.QName(node).localname, ref)
+        if decl is None:
+            raise ValueError(f"Unresolved {etree.QName(node).localname} reference {ref!r}")
+        return decl
+
+    def tag(self, node):
+        node = self.declaration(node)
+        name = node.get("name")
+        if not name:
+            raise ValueError(f"Expected a named declaration at line {node.sourceline}")
+        root = node.getroottree().getroot()
+        kind = etree.QName(node).localname
+        form = node.get("form", root.get(kind + "FormDefault", "unqualified"))
+        uri = self._ns[root] if node.getparent() is root or form == "qualified" else ""
+        return f"{{{uri}}}{name}" if uri else name
+
+    def type_of(self, node):
+        node = self.declaration(node)
+        for kind in ("complexType", "simpleType"):
+            typ = node.find(XS + kind)
+            if typ is not None:
+                return typ
+        name = node.get("type")
+        if name:
+            for kind in ("complexType", "simpleType"):
+                typ = self.resolve(node, kind, name)
+                if typ is not None:
+                    return typ
+        return None
+
+
 
